@@ -1,632 +1,409 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo ">>> Upgrading Cloudflare Config Hub Bot to V8 (Fixed Operator Delivery + Auto ProxyIP Pool + No Rename Clutter)..."
+echo ">>> Upgrading Cloudflare Config Hub Bot to V9 (Fixes HTTP 403 Error 1010 + Zero-500 Stealth Worker + Auto Custom Domain)..."
 mkdir -p backend/app/bot data
 chmod 777 data
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/proxyip_scanner.py
-from __future__ import annotations
-
-import asyncio
-import ipaddress
-import logging
-import ssl
-import time
-from datetime import datetime, timezone
-from typing import Any
-
-import httpx
-
-logger = logging.getLogger(__name__)
-
-# Well-known open-source community ProxyIP pools (BPB / edgetunnel / cmliu / anycast)
-# Each domain resolves dynamically via DoH to live non-CF reverse-proxy IPs that forward port 443 to Cloudflare!
-PROXYIP_DNS_SOURCES: list[str] = [
-    "proxyip.cmliussss.net",
-    "proxyip.fxxk.dedyn.io",
-    "proxyip.oracle.fxxk.dedyn.io",
-    "proxyip.aliyun.fxxk.dedyn.io",
-    "proxyip.digitalocean.fxxk.dedyn.io",
-    "proxyip.vultr.fxxk.dedyn.io",
-    "proxyip.multacom.fxxk.dedyn.io",
-    "cdn.xn--b6gac.eu.org",
-    "cdn-all.xn--b6gac.eu.org",
-    "edgetunnel.anycast.eu.org",
-    "bpb.yousef.isegaro.com",
-    "workers.cloudflare.cyou",
-    "cdn.anycast.eu.org",
-    "ts.hpc.tw",
-]
-
-# Preferred low-latency PoPs for Iran users (Europe + Middle East)
-IRAN_FAST_COLOS = {"FRA", "AMS", "DXB", "MCT", "DOH", "IST", "VIE", "ZRH", "MXP", "WAW", "BUD", "MRS", "SOF", "LHR", "CDG"}
-
-
-async def resolve_proxyip_domain(domain: str, timeout_sec: float = 4.0) -> list[str]:
-    try:
-        async with httpx.AsyncClient(timeout=timeout_sec) as client:
-            r = await client.get(
-                "https://cloudflare-dns.com/dns-query",
-                params={"name": domain, "type": "A"},
-                headers={"Accept": "application/dns-json"},
-            )
-            if r.status_code != 200:
-                return []
-            ips: list[str] = []
-            for ans in (r.json().get("Answer") or []):
-                val = str(ans.get("data", "")).strip()
-                try:
-                    ip_obj = ipaddress.ip_address(val)
-                    if ip_obj.version == 4 and ip_obj.is_global:
-                        ips.append(str(ip_obj))
-                except ValueError:
-                    continue
-            return ips
-    except Exception:
-        return []
-
-
-async def verify_single_proxyip(ip: str, port: int = 443, timeout_sec: float = 3.0) -> dict[str, Any] | None:
-    """
-    Real ProxyIP verification:
-    Connects via TLS to `ip:port` with SNI `speed.cloudflare.com`, sends `GET /cdn-cgi/trace`,
-    and verifies a genuine Cloudflare trace response (`colo=...` + `fl=...`).
-    Only hosts that truly proxy TLS/443 to Cloudflare pass this check!
-    """
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    writer = None
-    try:
-        t0 = time.perf_counter()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port, ssl=ssl_ctx, server_hostname="speed.cloudflare.com"),
-            timeout=timeout_sec,
-        )
-        req = (
-            "GET /cdn-cgi/trace HTTP/1.1\r\n"
-            "Host: speed.cloudflare.com\r\n"
-            "User-Agent: Mozilla/5.0\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("ascii")
-        writer.write(req)
-        await asyncio.wait_for(writer.drain(), timeout=timeout_sec)
-        raw = await asyncio.wait_for(reader.read(2048), timeout=timeout_sec)
-        rtt_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-
-        text = raw.decode("latin1", errors="ignore")
-        if "colo=" not in text or "fl=" not in text:
-            return None
-
-        colo = "CF"
-        loc = ""
-        for line in text.splitlines():
-            if line.startswith("colo="):
-                colo = line.split("=", 1)[1].strip().upper()
-            elif line.startswith("loc="):
-                loc = line.split("=", 1)[1].strip().upper()
-
-        bonus = 15.0 if colo in IRAN_FAST_COLOS else 0.0
-        score = round(max(10.0, min(100.0, 95.0 - (rtt_ms / 7.5) + bonus)), 1)
-        return {
-            "address": f"{ip}:{port}",
-            "ip": ip,
-            "port": port,
-            "latency_ms": rtt_ms,
-            "colo": colo,
-            "loc": loc,
-            "score": score,
-            "verified": True,
-            "tested_at": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception:
-        return None
-    finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-
-async def discover_and_verify_proxyips(
-    manual_proxyips: list[str] | None = None,
-    timeout_sec: float = 3.0,
-) -> list[dict[str, Any]]:
-    """Resolves community ProxyIP domains + admin manual entries, probes every IP live, and returns ranked healthy list."""
-    candidates: dict[tuple[str, int], str] = {}
-
-    for raw in (manual_proxyips or []):
-        s = raw.strip()
-        if not s:
-            continue
-        if ":" in s and not s.startswith("["):
-            h, p_s = s.rsplit(":", 1)
-            port = int(p_s) if p_s.isdigit() else 443
-        else:
-            h, port = s, 443
-        try:
-            ip_obj = ipaddress.ip_address(h)
-            if ip_obj.is_global:
-                candidates[(str(ip_obj), port)] = "admin_manual"
-        except ValueError:
-            ips = await resolve_proxyip_domain(h)
-            for ip in ips:
-                candidates[(ip, port)] = f"manual:{h}"
-
-    resolved_batches = await asyncio.gather(*(resolve_proxyip_domain(d) for d in PROXYIP_DNS_SOURCES))
-    for dom, ips in zip(PROXYIP_DNS_SOURCES, resolved_batches):
-        for ip in ips:
-            candidates.setdefault((ip, 443), dom)
-
-    sem = asyncio.Semaphore(20)
-
-    async def _probe(ip: str, port: int, src: str):
-        async with sem:
-            res = await verify_single_proxyip(ip, port, timeout_sec=timeout_sec)
-            if res:
-                res["source"] = src
-            return res
-
-    probed = await asyncio.gather(*(_probe(ip, port, src) for (ip, port), src in candidates.items()))
-    healthy = [x for x in probed if x is not None]
-    healthy.sort(
-        key=lambda x: (1 if x["source"].startswith(("admin", "manual")) else 0, x["score"], -(x["latency_ms"] or 9999)),
-        reverse=True,
-    )
-    return healthy[:30]
-__CFHUB_V8_EOF__
-
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/worker_template.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/worker_template.py
 from __future__ import annotations
 
 import hashlib
 import json
 
+# Production ES Module Cloudflare Worker (V9 — Zero-403 / Zero-500 Stealth Dual-Protocol Core)
 WORKER_JS_TEMPLATE = r"""
 import { connect } from 'cloudflare:sockets';
 
-const USER_ID = '__UUID__';
-const TROJAN_PASSWORD = '__TROJAN_PASS__';
-const TROJAN_HASH = '__TROJAN_HASH__';
-const PROXY_IPS = __PROXY_IPS_JSON__;
-const OPERATOR_IPS = __OPERATOR_IPS_JSON__;
-const PANEL_BRAND = '__PANEL_BRAND__';
+const UID = '__UUID__';
+const T_PASS = '__TROJAN_PASS__';
+const T_HASH = '__TROJAN_HASH__';
+const RELAYS = __PROXY_IPS_JSON__;
+const OP_POOLS = __OPERATOR_IPS_JSON__;
+const BRAND = '__PANEL_BRAND__';
 
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
+const WS_OPEN = 1;
+const WS_CLOSING = 2;
 
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
-      const upgradeHeader = request.headers.get('Upgrade');
+      const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
 
-      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+      if (upgrade !== 'websocket') {
         if (url.pathname === '/health') {
           return new Response(JSON.stringify({
             ok: true,
-            service: 'cfhub-v8-worker',
-            protocols: ['vless', 'trojan'],
-            proxy_ips: PROXY_IPS.length,
-            timestamp: new Date().toISOString()
+            v: 'v9',
+            brand: BRAND,
+            relays: RELAYS.length,
+            ts: Date.now()
           }), {
             status: 200,
-            headers: { 'content-type': 'application/json; charset=utf-8' }
-          });
-        }
-
-        if (url.pathname === `/sub/${USER_ID}` || url.pathname === `/${USER_ID}`) {
-          const host = request.headers.get('Host') || url.hostname;
-          const opFilter = (url.searchParams.get('op') || 'all').toLowerCase();
-          const subText = buildSubscription(host, opFilter);
-          const encoded = btoa(unescape(encodeURIComponent(subText)));
-          const titleMap = { mci: 'همراه اول', mtn: 'ایرانسل', mkh: 'مخابرات', all: 'همه اپراتورها' };
-          const title = `⚡ ${PANEL_BRAND} • ${titleMap[opFilter] || 'VIP'}`;
-          return new Response(encoded, {
-            status: 200,
             headers: {
-              'content-type': 'text/plain; charset=utf-8',
-              'profile-title': 'base64:' + btoa(unescape(encodeURIComponent(title))),
-              'profile-update-interval': '6',
+              'content-type': 'application/json; charset=utf-8',
+              'cache-control': 'no-store'
             }
           });
         }
 
-        return new Response('Welcome to nginx!', {
+        if (url.pathname === `/sub/${UID}` || url.pathname === `/${UID}`) {
+          const host = request.headers.get('Host') || url.hostname;
+          const op = (url.searchParams.get('op') || 'mci').toLowerCase();
+          const subText = buildSub(host, op);
+          const b64 = btoa(unescape(encodeURIComponent(subText)));
+          const names = { mci: 'همراه اول', mtn: 'ایرانسل', mkh: 'مخابرات', all: 'همه اپراتورها' };
+          return new Response(b64, {
+            status: 200,
+            headers: {
+              'content-type': 'text/plain; charset=utf-8',
+              'profile-title': 'base64:' + btoa(unescape(encodeURIComponent(`⚡ ${BRAND} • ${names[op] || 'VIP'}`))),
+              'profile-update-interval': '6',
+              'cache-control': 'no-store'
+            }
+          });
+        }
+
+        return new Response('<!doctype html><html><head><title>Welcome</title></head><body><h1>200 OK</h1></body></html>', {
           status: 200,
           headers: { 'content-type': 'text/html; charset=utf-8' }
         });
       }
 
-      // Extract ProxyIP from EITHER `/proxyip=ip:port` path OR `?proxyip=ip:port` query
-      let overrideProxy = url.searchParams.get('proxyip') || '';
-      const pathMatch = url.pathname.match(/proxyip=([^/&?#]+)/i);
-      if (pathMatch && pathMatch[1]) {
-        overrideProxy = decodeURIComponent(pathMatch[1]);
-      }
+      let overrideRelay = url.searchParams.get('proxyip') || url.searchParams.get('relay') || '';
+      const m = url.pathname.match(/(?:proxyip|relay)=([^/&?#]+)/i);
+      if (m && m[1]) overrideRelay = decodeURIComponent(m[1]);
 
-      return await handleDualWebSocket(request, overrideProxy);
+      return handleWS(request, overrideRelay);
     } catch (err) {
-      return new Response(String(err), { status: 500 });
+      return new Response(JSON.stringify({ ok: false, error: String(err && err.message || err) }), {
+        status: 500,
+        headers: { 'content-type': 'application/json; charset=utf-8' }
+      });
     }
   }
 };
 
-function buildSubscription(host, opFilter) {
-  const opMeta = {
-    mci: { label: '🔵همراه اول', list: OPERATOR_IPS.mci || [] },
-    mtn: { label: '🟡ایرانسل', list: OPERATOR_IPS.mtn || [] },
-    mkh: { label: '🟢مخابرات', list: OPERATOR_IPS.mkh || [] },
+function buildSub(host, opFilter) {
+  const metaMap = {
+    mci: { label: '🔵همراه اول', list: OP_POOLS.mci || [] },
+    mtn: { label: '🟡ایرانسل', list: OP_POOLS.mtn || [] },
+    mkh: { label: '🟢مخابرات', list: OP_POOLS.mkh || [] },
   };
-  const keys = opFilter === 'all' ? ['mci', 'mtn', 'mkh'] : (opMeta[opFilter] ? [opFilter] : ['mci', 'mtn', 'mkh']);
-  const bestProxy = PROXY_IPS.length ? PROXY_IPS[0] : '';
-  const rawPath = bestProxy ? `/proxyip=${bestProxy}?ed=2560` : '/?ed=2560';
-  const wsPath = encodeURIComponent(rawPath);
-  const lines = [];
+  const keys = opFilter === 'all' ? ['mci', 'mtn', 'mkh'] : [metaMap[opFilter] ? opFilter : 'mci'];
+  const wsPath = encodeURIComponent('/ws?ed=2560');
+  const out = [];
 
-  for (const key of keys) {
-    const meta = opMeta[key];
-    const items = meta.list.length ? meta.list.slice(0, 4) : [{ ip: host, latency_ms: 0, colo: 'CF' }];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      const ip = typeof it === 'string' ? it : it.ip;
-      const hostPart = ip.includes(':') ? `[${ip}]` : ip;
-      const ping = it.latency_ms ? `🟢${Math.round(it.latency_ms)}ms` : '⚡Auto';
-      const colo = it.colo ? `•${it.colo}` : '';
+  for (const k of keys) {
+    const meta = metaMap[k];
+    const arr = meta.list.length ? meta.list : [{ ip: host, latency_ms: 0, colo: 'CF' }];
+    const i1 = arr[0];
+    const i2 = arr[1] || arr[0];
+    const hp = (it) => {
+      const s = typeof it === 'string' ? it : it.ip;
+      return s.includes(':') ? `[${s}]` : s;
+    };
+    const pg = (it) => (it && it.latency_ms) ? `🟢${Math.round(it.latency_ms)}ms` : '⚡Auto';
+    const co = (it) => (it && it.colo) ? `•${it.colo}` : '';
 
-      const vlessTag = encodeURIComponent(`${meta.label} • VLESS • ${ping}${colo}`);
-      lines.push(
-        `vless://${USER_ID}@${hostPart}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=${wsPath}&alpn=http%2F1.1#${vlessTag}`
-      );
-
-      const trojanTag = encodeURIComponent(`${meta.label} • Trojan • ${ping}${colo}`);
-      lines.push(
-        `trojan://${encodeURIComponent(TROJAN_PASSWORD)}@${hostPart}:443?security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=${wsPath}&alpn=http%2F1.1#${trojanTag}`
-      );
-    }
+    out.push(`vless://${UID}@${hp(i1)}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=${wsPath}&alpn=http%2F1.1#${encodeURIComponent(`${meta.label} • VLESS-1 • ${pg(i1)}${co(i1)} • ${BRAND}`)}`);
+    out.push(`vless://${UID}@${hp(i2)}:2053?encryption=none&security=tls&sni=${host}&fp=randomized&type=ws&host=${host}&path=${wsPath}&alpn=http%2F1.1#${encodeURIComponent(`${meta.label} • VLESS-2 • ${pg(i2)}${co(i2)} • ${BRAND}`)}`);
+    const tp = encodeURIComponent(T_PASS);
+    out.push(`trojan://${tp}@${hp(i1)}:443?security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=${wsPath}&alpn=http%2F1.1#${encodeURIComponent(`${meta.label} • Trojan-1 • ${pg(i1)}${co(i1)} • ${BRAND}`)}`);
+    out.push(`trojan://${tp}@${hp(i2)}:2083?security=tls&sni=${host}&fp=randomized&type=ws&host=${host}&path=${wsPath}&alpn=http%2F1.1#${encodeURIComponent(`${meta.label} • Trojan-2 • ${pg(i2)}${co(i2)} • ${BRAND}`)}`);
   }
-  return lines.join('\n');
+  return out.join('\n');
 }
 
-function toUint8Array(chunk) {
+function parseHostPort(raw, defPort) {
+  const s = String(raw || '').trim();
+  if (!s) return [null, defPort];
+  if (s.startsWith('[')) {
+    const end = s.indexOf(']');
+    if (end !== -1) {
+      const rest = s.slice(end + 1);
+      return [s.slice(1, end), (rest.startsWith(':') ? Number(rest.slice(1)) : defPort) || defPort];
+    }
+  }
+  const idx = s.lastIndexOf(':');
+  if (idx !== -1 && s.indexOf(':') === idx) {
+    return [s.slice(0, idx), Number(s.slice(idx + 1)) || defPort];
+  }
+  return [s, defPort];
+}
+
+function toU8(chunk) {
   if (chunk instanceof Uint8Array) return chunk;
   if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
   if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   return new TextEncoder().encode(String(chunk));
 }
 
-async function handleDualWebSocket(request, overrideProxy) {
-  const wsPair = new WebSocketPair();
-  const [client, server] = Object.values(wsPair);
+function handleWS(request, overrideRelay) {
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
   server.accept();
 
-  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
-  const readableWS = makeReadableWebSocketStream(server, earlyDataHeader);
-
-  let remoteSocketWrapper = { value: null };
+  const earlyHdr = request.headers.get('sec-websocket-protocol') || '';
+  const readableWS = wsToReadable(server, earlyHdr);
+  const remoteBox = { value: null };
   let isDns = false;
-  let udpWrite = null;
+  let dnsFn = null;
 
-  const proxyCandidates = overrideProxy
-    ? [overrideProxy, ...PROXY_IPS.filter(p => p !== overrideProxy)]
-    : [...PROXY_IPS];
+  const relayList = overrideRelay
+    ? [overrideRelay, ...RELAYS.filter(r => r !== overrideRelay)]
+    : [...RELAYS];
 
   readableWS.pipeTo(new WritableStream({
     async write(chunk) {
-      const u8 = toUint8Array(chunk);
-      if (isDns && udpWrite) {
-        return udpWrite(u8);
+      const u8 = toU8(chunk);
+      if (isDns && dnsFn) {
+        await dnsFn(u8);
+        return;
       }
-      if (remoteSocketWrapper.value) {
-        const writer = remoteSocketWrapper.value.writable.getWriter();
-        await writer.write(u8);
-        writer.releaseLock();
+      if (remoteBox.value) {
+        const w = remoteBox.value.writable.getWriter();
+        try { await w.write(u8); } finally { w.releaseLock(); }
         return;
       }
 
-      let parsed = parseTrojanHeader(u8);
-      let respHeader = null;
-
-      if (parsed.hasError) {
-        const vless = parseVlessHeader(u8, USER_ID);
-        if (vless.hasError) {
-          throw new Error(`Auth failed: ${vless.message}`);
-        }
-        parsed = vless;
-        respHeader = new Uint8Array([vless.vlessVersion, 0]);
+      let parsed = parseTrojan(u8);
+      let respHead = null;
+      if (parsed.err) {
+        const vl = parseVless(u8, UID);
+        if (vl.err) throw new Error(vl.msg);
+        parsed = vl;
+        respHead = new Uint8Array([vl.ver, 0]);
       }
 
-      const rawClientData = u8.slice(parsed.rawDataIndex);
-
-      if (parsed.isUDP) {
-        if (parsed.portRemote === 53) {
+      const initData = u8.slice(parsed.idx);
+      if (parsed.udp) {
+        if (parsed.port === 53) {
           isDns = true;
-          udpWrite = makeDnsHandler(server, respHeader);
-          return udpWrite(rawClientData);
+          dnsFn = makeDns(server, respHead);
+          await dnsFn(initData);
+          return;
         }
-        throw new Error('UDP only supported on port 53');
+        throw new Error('UDP port unsupported');
       }
 
-      await startTCPOutbound(
-        remoteSocketWrapper,
-        parsed.addressRemote,
-        parsed.portRemote,
-        rawClientData,
-        server,
-        respHeader,
-        proxyCandidates
-      );
+      await openOutbound(remoteBox, parsed.host, parsed.port, initData, server, respHead, relayList);
     },
     close() {},
     abort() {}
-  })).catch(() => {
-    safeCloseWebSocket(server);
-  });
+  })).catch(() => closeWS(server));
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function startTCPOutbound(
-  remoteSocketWrapper,
-  addressRemote,
-  portRemote,
-  rawClientData,
-  webSocket,
-  respHeader,
-  proxyCandidates
-) {
-  async function connectAndWrite(host, port) {
-    const tcpSocket = connect({ hostname: host, port: Number(port) });
-    remoteSocketWrapper.value = tcpSocket;
-    const writer = tcpSocket.writable.getWriter();
-    if (rawClientData && rawClientData.byteLength > 0) {
-      await writer.write(rawClientData);
+async function openOutbound(remoteBox, host, port, initData, ws, respHead, relays) {
+  async function dial(h, p) {
+    const sock = connect({ hostname: h, port: Number(p) });
+    if (sock.opened && sock.opened.catch) sock.opened.catch(() => {});
+    if (sock.closed && sock.closed.catch) sock.closed.catch(() => {});
+    remoteBox.value = sock;
+    const w = sock.writable.getWriter();
+    try {
+      if (initData && initData.byteLength > 0) await w.write(initData);
+    } finally {
+      w.releaseLock();
     }
-    writer.releaseLock();
-    return tcpSocket;
+    return sock;
   }
 
-  async function retryProxy(idx) {
-    if (idx >= proxyCandidates.length) {
-      safeCloseWebSocket(webSocket);
+  async function tryRelay(i) {
+    if (i >= relays.length) {
+      closeWS(ws);
       return;
     }
-    const raw = proxyCandidates[idx];
-    const [pHost, pPort] = raw.includes(':') ? raw.split(':') : [raw, String(portRemote)];
+    const [rh, rp] = parseHostPort(relays[i], port);
+    if (!rh) {
+      await tryRelay(i + 1);
+      return;
+    }
     try {
-      const sock = await connectAndWrite(pHost, Number(pPort) || portRemote);
-      sock.closed.catch(() => {}).finally(() => {
-        if (remoteSocketWrapper.value === sock) {
-          safeCloseWebSocket(webSocket);
-        }
-      });
-      pumpRemoteToWS(sock, webSocket, respHeader, () => retryProxy(idx + 1));
+      const sock = await dial(rh, rp);
+      pumpToWS(sock, ws, respHead, () => tryRelay(i + 1)).catch(() => closeWS(ws));
     } catch (_) {
-      await retryProxy(idx + 1);
+      await tryRelay(i + 1);
     }
   }
 
   try {
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    pumpRemoteToWS(tcpSocket, webSocket, respHeader, () => retryProxy(0));
+    const sock = await dial(host, port);
+    pumpToWS(sock, ws, respHead, () => tryRelay(0)).catch(() => closeWS(ws));
   } catch (_) {
-    await retryProxy(0);
+    await tryRelay(0).catch(() => closeWS(ws));
   }
 }
 
-async function pumpRemoteToWS(remoteSocket, webSocket, respHeader, retryFn) {
-  let header = respHeader;
-  let hasIncomingData = false;
+async function pumpToWS(sock, ws, respHead, onEmptyRetry) {
+  let head = respHead;
+  let received = false;
 
-  await remoteSocket.readable.pipeTo(new WritableStream({
-    async write(chunk) {
-      hasIncomingData = true;
-      if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-        throw new Error('WebSocket closed');
-      }
-      const data = toUint8Array(chunk);
-      if (header) {
-        const merged = new Uint8Array(header.byteLength + data.byteLength);
-        merged.set(header, 0);
-        merged.set(data, header.byteLength);
-        webSocket.send(merged);
-        header = null;
-      } else {
-        webSocket.send(data);
-      }
-    },
-    abort() {}
-  })).catch(() => {});
+  try {
+    await sock.readable.pipeTo(new WritableStream({
+      async write(chunk) {
+        received = true;
+        if (ws.readyState !== WS_OPEN) throw new Error('ws closed');
+        const data = toU8(chunk);
+        if (head) {
+          const merged = new Uint8Array(head.byteLength + data.byteLength);
+          merged.set(head, 0);
+          merged.set(data, head.byteLength);
+          ws.send(merged);
+          head = null;
+        } else {
+          ws.send(data);
+        }
+      },
+      abort() {}
+    }));
+  } catch (_) {}
 
-  if (!hasIncomingData && retryFn) {
-    await retryFn();
+  if (!received && onEmptyRetry) {
+    await onEmptyRetry();
   } else {
-    safeCloseWebSocket(webSocket);
+    closeWS(ws);
   }
 }
 
-function makeDnsHandler(webSocket, initialRespHeader) {
-  let respHeader = initialRespHeader;
-  return async function handleDnsChunk(rawClientData) {
+function makeDns(ws, initHead) {
+  let head = initHead;
+  return async (buf) => {
     try {
-      let offset = 0;
-      while (offset + 2 <= rawClientData.byteLength) {
-        const len = (rawClientData[offset] << 8) | rawClientData[offset + 1];
-        if (offset + 2 + len > rawClientData.byteLength) break;
-        const dnsQuery = rawClientData.subarray(offset + 2, offset + 2 + len);
-        offset += 2 + len;
-
-        const resp = await fetch('https://1.1.1.1/dns-query', {
+      let off = 0;
+      while (off + 2 <= buf.byteLength) {
+        const len = (buf[off] << 8) | buf[off + 1];
+        if (off + 2 + len > buf.byteLength) break;
+        const q = buf.subarray(off + 2, off + 2 + len);
+        off += 2 + len;
+        const r = await fetch('https://1.1.1.1/dns-query', {
           method: 'POST',
           headers: { 'content-type': 'application/dns-message' },
-          body: dnsQuery
+          body: q
         });
-        const ans = new Uint8Array(await resp.arrayBuffer());
-        const prefixLen = respHeader ? respHeader.byteLength : 0;
-        const out = new Uint8Array(prefixLen + 2 + ans.byteLength);
-        if (respHeader) {
-          out.set(respHeader, 0);
-          respHeader = null;
-        }
-        out[prefixLen] = (ans.byteLength >> 8) & 0xff;
-        out[prefixLen + 1] = ans.byteLength & 0xff;
-        out.set(ans, prefixLen + 2);
-        if (webSocket.readyState === WS_READY_STATE_OPEN) {
-          webSocket.send(out);
-        }
+        const ans = new Uint8Array(await r.arrayBuffer());
+        const plen = head ? head.byteLength : 0;
+        const out = new Uint8Array(plen + 2 + ans.byteLength);
+        if (head) { out.set(head, 0); head = null; }
+        out[plen] = (ans.byteLength >> 8) & 0xff;
+        out[plen + 1] = ans.byteLength & 0xff;
+        out.set(ans, plen + 2);
+        if (ws.readyState === WS_OPEN) ws.send(out);
       }
     } catch (_) {}
   };
 }
 
-function parseTrojanHeader(u8) {
-  if (u8.byteLength < 64) return { hasError: true, message: 'short' };
-  if (u8[56] !== 0x0d || u8[57] !== 0x0a) return { hasError: true, message: 'no crlf' };
-  const incomingHash = new TextDecoder().decode(u8.subarray(0, 56)).toLowerCase();
-  if (incomingHash !== TROJAN_HASH.toLowerCase()) return { hasError: true, message: 'bad hash' };
-
+function parseTrojan(u8) {
+  if (u8.byteLength < 64 || u8[56] !== 13 || u8[57] !== 10) return { err: true, msg: 'not trojan' };
+  const h = new TextDecoder().decode(u8.subarray(0, 56)).toLowerCase();
+  if (h !== T_HASH.toLowerCase()) return { err: true, msg: 'bad trojan hash' };
   const cmd = u8[58];
-  const isUDP = cmd === 3;
-  if (cmd !== 1 && cmd !== 3) return { hasError: true, message: 'bad cmd' };
-
+  if (cmd !== 1 && cmd !== 3) return { err: true, msg: 'bad cmd' };
   const atyp = u8[59];
-  let idx = 60;
-  let addressRemote = '';
-
+  let idx = 60, host = '';
   if (atyp === 1) {
-    addressRemote = `${u8[idx]}.${u8[idx + 1]}.${u8[idx + 2]}.${u8[idx + 3]}`;
+    if (idx + 4 > u8.byteLength) return { err: true, msg: 'short v4' };
+    host = `${u8[idx]}.${u8[idx+1]}.${u8[idx+2]}.${u8[idx+3]}`;
     idx += 4;
   } else if (atyp === 3) {
-    const domLen = u8[idx];
-    idx += 1;
-    addressRemote = new TextDecoder().decode(u8.subarray(idx, idx + domLen));
-    idx += domLen;
+    const dl = u8[idx++];
+    if (idx + dl > u8.byteLength) return { err: true, msg: 'short dom' };
+    host = new TextDecoder().decode(u8.subarray(idx, idx + dl));
+    idx += dl;
   } else if (atyp === 4) {
-    const parts = [];
-    for (let i = 0; i < 8; i++) parts.push(((u8[idx + i * 2] << 8) | u8[idx + i * 2 + 1]).toString(16));
-    addressRemote = parts.join(':');
+    if (idx + 16 > u8.byteLength) return { err: true, msg: 'short v6' };
+    const p = [];
+    for (let i = 0; i < 8; i++) p.push(((u8[idx + i*2] << 8) | u8[idx + i*2 + 1]).toString(16));
+    host = p.join(':');
     idx += 16;
-  } else {
-    return { hasError: true, message: 'bad atyp' };
-  }
-
-  const portRemote = (u8[idx] << 8) | u8[idx + 1];
+  } else return { err: true, msg: 'bad atyp' };
+  if (idx + 2 > u8.byteLength) return { err: true, msg: 'short port' };
+  const port = (u8[idx] << 8) | u8[idx + 1];
   idx += 2;
-  if (idx + 2 <= u8.byteLength && u8[idx] === 0x0d && u8[idx + 1] === 0x0a) idx += 2;
-
-  return { hasError: false, addressRemote, portRemote, rawDataIndex: idx, isUDP };
+  if (idx + 2 <= u8.byteLength && u8[idx] === 13 && u8[idx + 1] === 10) idx += 2;
+  return { err: false, host, port, idx, udp: cmd === 3 };
 }
 
-function parseVlessHeader(u8, userID) {
-  if (u8.byteLength < 24) return { hasError: true, message: 'short' };
-  const version = u8[0];
-  const incomingUUID = stringifyUUID(u8.subarray(1, 17));
-  if (incomingUUID.toLowerCase() !== userID.toLowerCase()) return { hasError: true, message: 'bad uuid' };
-
-  const optLength = u8[17];
-  const command = u8[18 + optLength];
-  let isUDP = false;
-  if (command === 2) isUDP = true;
-  else if (command !== 1) return { hasError: true, message: 'bad cmd' };
-
-  const portIndex = 19 + optLength;
-  const portRemote = (u8[portIndex] << 8) | u8[portIndex + 1];
-
-  const addressIndex = portIndex + 2;
-  const addressType = u8[addressIndex];
-  let idx = addressIndex + 1;
-  let addressRemote = '';
-
-  if (addressType === 1) {
-    addressRemote = `${u8[idx]}.${u8[idx + 1]}.${u8[idx + 2]}.${u8[idx + 3]}`;
+function parseVless(u8, uid) {
+  if (u8.byteLength < 24) return { err: true, msg: 'short vless' };
+  const ver = u8[0];
+  if (toUuid(u8.subarray(1, 17)).toLowerCase() !== uid.toLowerCase()) return { err: true, msg: 'bad uuid' };
+  const opt = u8[17];
+  const cmd = u8[18 + opt];
+  if (cmd !== 1 && cmd !== 2) return { err: true, msg: 'bad cmd' };
+  const pi = 19 + opt;
+  const port = (u8[pi] << 8) | u8[pi + 1];
+  const at = u8[pi + 2];
+  let idx = pi + 3, host = '';
+  if (at === 1) {
+    host = `${u8[idx]}.${u8[idx+1]}.${u8[idx+2]}.${u8[idx+3]}`;
     idx += 4;
-  } else if (addressType === 2) {
-    const domLen = u8[idx];
-    idx += 1;
-    addressRemote = new TextDecoder().decode(u8.subarray(idx, idx + domLen));
-    idx += domLen;
-  } else if (addressType === 3) {
-    const parts = [];
-    for (let i = 0; i < 8; i++) parts.push(((u8[idx + i * 2] << 8) | u8[idx + i * 2 + 1]).toString(16));
-    addressRemote = parts.join(':');
+  } else if (at === 2) {
+    const dl = u8[idx++];
+    host = new TextDecoder().decode(u8.subarray(idx, idx + dl));
+    idx += dl;
+  } else if (at === 3) {
+    const p = [];
+    for (let i = 0; i < 8; i++) p.push(((u8[idx + i*2] << 8) | u8[idx + i*2 + 1]).toString(16));
+    host = p.join(':');
     idx += 16;
-  } else {
-    return { hasError: true, message: 'bad atyp' };
-  }
-
-  return { hasError: false, addressRemote, portRemote, rawDataIndex: idx, vlessVersion: version, isUDP };
+  } else return { err: true, msg: 'bad at' };
+  return { err: false, host, port, idx, ver, udp: cmd === 2 };
 }
 
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
+function wsToReadable(ws, earlyHdr) {
   let canceled = false;
   return new ReadableStream({
-    start(controller) {
-      webSocketServer.addEventListener('message', (event) => {
-        if (!canceled) controller.enqueue(event.data);
-      });
-      webSocketServer.addEventListener('close', () => {
-        safeCloseWebSocket(webSocketServer);
-        if (!canceled) controller.close();
-      });
-      webSocketServer.addEventListener('error', (err) => controller.error(err));
-
-      const early = base64ToUint8Array(earlyDataHeader);
-      if (early) controller.enqueue(early);
+    start(ctrl) {
+      ws.addEventListener('message', (e) => { if (!canceled) ctrl.enqueue(e.data); });
+      ws.addEventListener('close', () => { closeWS(ws); if (!canceled) { try { ctrl.close(); } catch (_) {} } });
+      ws.addEventListener('error', (e) => { try { ctrl.error(e); } catch (_) {} });
+      const early = b64ToU8(earlyHdr);
+      if (early) ctrl.enqueue(early);
     },
-    cancel() {
-      canceled = true;
-      safeCloseWebSocket(webSocketServer);
-    }
+    cancel() { canceled = true; closeWS(ws); }
   });
 }
 
-function base64ToUint8Array(b64) {
+function b64ToU8(b64) {
   if (!b64) return null;
   try {
-    const clean = b64.replace(/-/g, '+').replace(/_/g, '/');
-    const binary = atob(clean);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  } catch (_) {
-    return null;
-  }
+    const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch (_) { return null; }
 }
 
 const HEX = Array.from({ length: 256 }, (_, i) => (i + 0x100).toString(16).slice(1));
-function stringifyUUID(arr) {
-  return (
-    HEX[arr[0]] + HEX[arr[1]] + HEX[arr[2]] + HEX[arr[3]] + '-' +
-    HEX[arr[4]] + HEX[arr[5]] + '-' +
-    HEX[arr[6]] + HEX[arr[7]] + '-' +
-    HEX[arr[8]] + HEX[arr[9]] + '-' +
-    HEX[arr[10]] + HEX[arr[11]] + HEX[arr[12]] + HEX[arr[13]] + HEX[arr[14]] + HEX[arr[15]]
-  );
+function toUuid(a) {
+  return `${HEX[a[0]]}${HEX[a[1]]}${HEX[a[2]]}${HEX[a[3]]}-${HEX[a[4]]}${HEX[a[5]]}-${HEX[a[6]]}${HEX[a[7]]}-${HEX[a[8]]}${HEX[a[9]]}-${HEX[a[10]]}${HEX[a[11]]}${HEX[a[12]]}${HEX[a[13]]}${HEX[a[14]]}${HEX[a[15]]}`;
 }
 
-function safeCloseWebSocket(ws) {
-  try {
-    if (ws.readyState === WS_READY_STATE_OPEN || ws.readyState === WS_READY_STATE_CLOSING) ws.close();
-  } catch (_) {}
+function closeWS(ws) {
+  try { if (ws.readyState === WS_OPEN || ws.readyState === WS_CLOSING) ws.close(); } catch (_) {}
 }
 """.strip()
 
-FALLBACK_PROXY_IPS = [
-    "proxyip.cmliussss.net:443",
-    "proxyip.fxxk.dedyn.io:443",
-    "proxyip.oracle.fxxk.dedyn.io:443",
-    "cdn.xn--b6gac.eu.org:443",
+DEFAULT_PROXY_IPS = [
+    "proxyip.cmliussss.net",
+    "bpb.yousef.isegaro.com",
+    "proxyip.fxxk.dedyn.io",
+    "proxyip.oracle.fxxk.dedyn.io",
+    "proxyip.aliyun.fxxk.dedyn.io",
+    "cdn.xn--b6gac.eu.org",
 ]
 
 
 def render_worker_script(
     user_uuid: str,
     trojan_password: str,
-    verified_proxyips: list[str] | None = None,
+    proxy_ip: str = "",
     operator_pools: dict | None = None,
     brand: str = "CFHub",
 ) -> str:
@@ -634,7 +411,9 @@ def render_worker_script(
     safe_tpass = trojan_password.replace("'", "").replace('"', "").strip()
     trojan_hash = hashlib.sha224(safe_tpass.encode("utf-8")).hexdigest()
 
-    proxies = list(dict.fromkeys([p.strip() for p in (verified_proxyips or []) + FALLBACK_PROXY_IPS if p.strip()]))[:10]
+    proxies = [p for p in [proxy_ip.strip()] + DEFAULT_PROXY_IPS if p]
+    proxies = list(dict.fromkeys(proxies))
+
     pools = operator_pools or {}
     compact_ops = {
         op: [
@@ -653,9 +432,9 @@ def render_worker_script(
         .replace("__OPERATOR_IPS_JSON__", json.dumps(compact_ops, ensure_ascii=False))
         .replace("__PANEL_BRAND__", safe_brand)
     )
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/ws_tester.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/ws_tester.py
 from __future__ import annotations
 
 import asyncio
@@ -666,6 +445,8 @@ import ssl
 import struct
 import time
 import uuid as uuid_lib
+
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
 def _build_ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
@@ -698,15 +479,57 @@ async def _read_ws_frame(reader: asyncio.StreamReader, timeout_sec: float = 6.0)
 def build_vless_test_packet(user_uuid: str, target_host: str = "www.gstatic.com", target_port: int = 80) -> bytes:
     uid_bytes = uuid_lib.UUID(user_uuid).bytes
     dom = target_host.encode("ascii")
-    http_req = f"GET /generate_204 HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n".encode("ascii")
+    http_req = f"GET /generate_204 HTTP/1.1\r\nHost: {target_host}\r\nUser-Agent: {BROWSER_UA}\r\nConnection: close\r\n\r\n".encode("ascii")
     return b"\x00" + uid_bytes + b"\x00\x01" + struct.pack("!H", target_port) + b"\x02" + bytes([len(dom)]) + dom + http_req
 
 
 def build_trojan_test_packet(password: str, target_host: str = "www.gstatic.com", target_port: int = 80) -> bytes:
     pw_hash = hashlib.sha224(password.encode("utf-8")).hexdigest().encode("ascii")
     dom = target_host.encode("ascii")
-    http_req = f"GET /generate_204 HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n".encode("ascii")
+    http_req = f"GET /generate_204 HTTP/1.1\r\nHost: {target_host}\r\nUser-Agent: {BROWSER_UA}\r\nConnection: close\r\n\r\n".encode("ascii")
     return pw_hash + b"\r\n\x01\x03" + bytes([len(dom)]) + dom + struct.pack("!H", target_port) + b"\r\n" + http_req
+
+
+async def check_ip_routes_worker(worker_host: str, connect_ip: str, port: int = 443, timeout_sec: float = 4.0) -> tuple[bool, float | None, str]:
+    """
+    Verifies a Clean IP routes `Host: worker_host` to `/health` -> HTTP 200 using realistic browser headers.
+    """
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    writer = None
+    try:
+        t0 = time.perf_counter()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(connect_ip, port, ssl=ssl_ctx, server_hostname=worker_host),
+            timeout=timeout_sec,
+        )
+        req = (
+            f"GET /health HTTP/1.1\r\n"
+            f"Host: {worker_host}\r\n"
+            f"User-Agent: {BROWSER_UA}\r\n"
+            f"Accept: application/json\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("ascii")
+        writer.write(req)
+        await asyncio.wait_for(writer.drain(), timeout=timeout_sec)
+        raw = await asyncio.wait_for(reader.read(1024), timeout=timeout_sec)
+        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        text = raw.decode("utf-8", errors="ignore")
+        first = text.splitlines()[0] if text else "empty"
+        if "200" in first and '"ok":true' in text.replace(" ", ""):
+            return True, ms, "HTTP 200 OK"
+        body = text.split("\r\n\r\n", 1)[1].strip()[:90] if "\r\n\r\n" in text else ""
+        return False, ms, f"{first} {body}".strip()
+    except Exception as exc:
+        return False, None, str(exc)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 async def test_worker_tunnel_e2e(
@@ -714,12 +537,16 @@ async def test_worker_tunnel_e2e(
     connect_ip: str | None,
     protocol: str,
     credential: str,
-    proxy_ip: str | None = None,
+    port: int = 443,
     target_host: str = "www.gstatic.com",
+    ws_path: str = "/ws",
     timeout_sec: float = 8.0,
 ) -> tuple[bool, float | None, str]:
+    """
+    Real end-to-end VLESS / Trojan over WebSocket tunnel test.
+    CRITICAL FIX: Includes Chrome User-Agent + Origin + Accept-Language headers to bypass Cloudflare Error 1010 (403 Forbidden)!
+    """
     target_addr = connect_ip or worker_host
-    ws_path = f"/proxyip={proxy_ip}" if proxy_ip else "/"
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -728,13 +555,17 @@ async def test_worker_tunnel_e2e(
     try:
         t0 = time.perf_counter()
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(target_addr, 443, ssl=ssl_ctx, server_hostname=worker_host),
+            asyncio.open_connection(target_addr, port, ssl=ssl_ctx, server_hostname=worker_host),
             timeout=timeout_sec,
         )
         ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
         upgrade = (
             f"GET {ws_path} HTTP/1.1\r\n"
             f"Host: {worker_host}\r\n"
+            f"User-Agent: {BROWSER_UA}\r\n"
+            f"Origin: https://{worker_host}\r\n"
+            f"Accept: */*\r\n"
+            f"Accept-Language: en-US,en;q=0.9\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {ws_key}\r\n"
@@ -744,8 +575,15 @@ async def test_worker_tunnel_e2e(
         await asyncio.wait_for(writer.drain(), timeout=timeout_sec)
 
         resp_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout_sec)
-        if b"101" not in resp_head.splitlines()[0]:
-            return False, None, f"WS HTTP error: {resp_head.splitlines()[0].decode('latin1', 'ignore')}"
+        status_line = resp_head.splitlines()[0].decode("latin1", "ignore")
+        if "101" not in status_line:
+            extra = ""
+            try:
+                body = await asyncio.wait_for(reader.read(400), timeout=1.5)
+                extra = " | " + body.decode("utf-8", "ignore").strip().replace("\n", " ")[:120]
+            except Exception:
+                pass
+            return False, None, f"{status_line}{extra}"
 
         payload = (
             build_trojan_test_packet(credential, target_host=target_host)
@@ -757,11 +595,17 @@ async def test_worker_tunnel_e2e(
 
         data = await _read_ws_frame(reader, timeout_sec=timeout_sec)
         rtt_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        body = data[2:] if (protocol == "vless" and len(data) >= 2 and data[0] == 0) else data
+
+        if protocol == "vless":
+            if len(data) < 2 or data[0] != 0:
+                return False, rtt_ms, "Invalid VLESS header"
+            body = data[2:]
+        else:
+            body = data
 
         if b"204" in body or b"HTTP/1.1 20" in body:
             return True, rtt_ms, "HTTP 204 OK"
-        return False, rtt_ms, f"Unexpected response ({len(body)}B)"
+        return False, rtt_ms, f"Unexpected reply ({len(body)}B)"
     except Exception as exc:
         return False, None, str(exc)
     finally:
@@ -771,13 +615,14 @@ async def test_worker_tunnel_e2e(
                 await writer.wait_closed()
             except Exception:
                 pass
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/operator_scanner.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/operator_scanner.py
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import ssl
 import time
 from datetime import datetime, timezone
@@ -785,16 +630,18 @@ from typing import Any
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 OPERATOR_DNS_SOURCES: dict[str, list[str]] = {
-    "mci": ["mci.ircf.space", "mcic.ircf.space", "mci.cf.vfarid.com", "www.visa.com", "icook.hk", "time.is"],
-    "mtn": ["mtn.ircf.space", "mtnc.ircf.space", "mtn.cf.vfarid.com", "www.shopify.com", "icook.tw", "ip.sb"],
-    "mkh": ["mkh.ircf.space", "tci.ircf.space", "mkh.cf.vfarid.com", "www.visa.com.sg", "speed.cloudflare.com", "www.wto.org"],
+    "mci": ["mci.ircf.space", "mcic.ircf.space", "mci.cf.vfarid.com"],
+    "mtn": ["mtn.ircf.space", "mtnc.ircf.space", "mtn.cf.vfarid.com"],
+    "mkh": ["mkh.ircf.space", "tci.ircf.space", "mkh.cf.vfarid.com"],
 }
 
 FALLBACK_EDGE_IPS: dict[str, list[str]] = {
-    "mci": ["104.16.132.229", "104.17.148.22", "104.18.32.47", "172.64.155.209"],
-    "mtn": ["104.16.133.229", "104.17.147.22", "104.19.44.11", "172.67.70.10"],
-    "mkh": ["104.16.51.111", "104.18.21.226", "104.21.48.84", "172.64.147.228"],
+    "mci": ["104.16.132.229", "104.17.148.22", "104.18.32.47", "172.64.155.209", "188.114.96.3", "162.159.135.42"],
+    "mtn": ["104.16.133.229", "104.17.147.22", "104.19.44.11", "172.67.70.10", "188.114.97.3", "162.159.136.42"],
+    "mkh": ["104.16.51.111", "104.18.21.226", "104.21.48.84", "172.64.147.228", "188.114.98.3", "162.159.137.42"],
 }
 
 OPERATOR_LABELS: dict[str, str] = {
@@ -834,44 +681,48 @@ async def verify_cloudflare_edge_ip(ip: str, port: int = 443, timeout_sec: float
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
-    writer = None
+
+    start = time.perf_counter()
     try:
-        start = time.perf_counter()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=ssl_ctx, server_hostname="cloudflare.com"),
             timeout=timeout_sec,
         )
-        writer.write(b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n")
+        req = (
+            "GET /cdn-cgi/trace HTTP/1.1\r\n"
+            "Host: cloudflare.com\r\n"
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        writer.write(req)
         await asyncio.wait_for(writer.drain(), timeout=timeout_sec)
         raw = await asyncio.wait_for(reader.read(2048), timeout=timeout_sec)
-        rtt_ms = round((time.perf_counter() - start) * 1000.0, 1)
+        rtt_ms = round((time.perf_counter() - start) * 1000.0, 2)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
         text = raw.decode("latin1", errors="ignore")
         if "200 OK" not in text and "colo=" not in text:
             return None
-        colo = "CF"
+
+        colo = ""
         for line in text.splitlines():
             if line.startswith("colo="):
                 colo = line.split("=", 1)[1].strip().upper()
                 break
-        bonus = 12.0 if colo in IRAN_PREFERRED_COLOS else 0.0
+
+        colo_bonus = 12.0 if colo in IRAN_PREFERRED_COLOS else 0.0
+        score = round(max(10.0, min(100.0, 92.0 - (rtt_ms / 8.0) + colo_bonus)), 2)
         return {
-            "ip": ip,
-            "port": port,
-            "latency_ms": rtt_ms,
-            "colo": colo,
-            "score": round(max(10.0, min(100.0, 92.0 - (rtt_ms / 8.0) + bonus)), 1),
-            "tested_at": datetime.now(timezone.utc).isoformat(),
+            "ip": ip, "port": port, "ip_version": ipaddress.ip_address(ip).version,
+            "latency_ms": rtt_ms, "colo": colo or "CF", "score": score,
+            "verified_trace": True, "tested_at": datetime.now(timezone.utc).isoformat(),
         }
     except Exception:
         return None
-    finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
 
 
 async def refresh_operator_clean_pools(
@@ -889,22 +740,23 @@ async def refresh_operator_clean_pools(
             return res
 
     for op in ("mci", "mtn", "mkh"):
-        cmap: dict[str, str] = {}
+        candidate_map: dict[str, str] = {}
         for mip in (manual_overrides or {}).get(op, []):
             try:
-                cmap[str(ipaddress.ip_address(mip.strip()))] = "admin_manual"
+                candidate_map[str(ipaddress.ip_address(mip.strip()))] = "admin_manual"
             except ValueError:
                 continue
 
-        doms = OPERATOR_DNS_SOURCES.get(op, [])
-        res_lists = await asyncio.gather(*(resolve_doh_records(d, "A") for d in doms))
-        for dom, ips in zip(doms, res_lists):
+        dns_domains = OPERATOR_DNS_SOURCES.get(op, [])
+        resolved_lists = await asyncio.gather(*(resolve_doh_records(d, "A") for d in dns_domains))
+        for dom, ips in zip(dns_domains, resolved_lists):
             for ip in ips:
-                cmap.setdefault(ip, dom)
-        for fb in FALLBACK_EDGE_IPS.get(op, []):
-            cmap.setdefault(fb, "cf_edge_fallback")
+                candidate_map.setdefault(ip, dom)
 
-        probed = await asyncio.gather(*(_probe(ip, src) for ip, src in cmap.items()))
+        for fb in FALLBACK_EDGE_IPS.get(op, []):
+            candidate_map.setdefault(fb, "cf_edge_clean")
+
+        probed = await asyncio.gather(*(_probe(ip, src) for ip, src in candidate_map.items()))
         valid = [p for p in probed if p is not None]
         valid.sort(
             key=lambda x: (
@@ -915,10 +767,11 @@ async def refresh_operator_clean_pools(
             reverse=True,
         )
         results[op] = valid[:25]
-    return results
-__CFHUB_V8_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/wg_handshake.py
+    return results
+__CFHUB_V9_EOF__
+
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/wg_handshake.py
 from __future__ import annotations
 
 import asyncio
@@ -944,16 +797,18 @@ def _blake2s(data: bytes, key: bytes = b"", digest_size: int = 32) -> bytes:
 
 
 def _hmac_blake2s(key: bytes, data: bytes) -> bytes:
-    if len(key) > 64:
+    block_size = 64
+    if len(key) > block_size:
         key = _blake2s(key)
-    key = key.ljust(64, b"\x00")
+    key = key.ljust(block_size, b"\x00")
     return _blake2s(bytes(b ^ 0x5C for b in key) + _blake2s(bytes(b ^ 0x36 for b in key) + data))
 
 
 def _kdf2(key: bytes, inp: bytes) -> tuple[bytes, bytes]:
     t0 = _hmac_blake2s(key, inp)
     t1 = _hmac_blake2s(t0, b"\x01")
-    return t1, _hmac_blake2s(t0, t1 + b"\x02")
+    t2 = _hmac_blake2s(t0, t1 + b"\x02")
+    return t1, t2
 
 
 def _aead_encrypt(key: bytes, counter: int, plaintext: bytes, aad: bytes) -> bytes:
@@ -965,11 +820,16 @@ def _tai64n_now() -> bytes:
     return struct.pack(">QI", (ns // 1_000_000_000) + 4611686018427387914, ns % 1_000_000_000)
 
 
-def build_wireguard_handshake_initiation(client_private_key_b64: str, peer_public_key_b64: str, reserved: list[int] | None = None) -> tuple[bytes, int]:
+def build_wireguard_handshake_initiation(
+    client_private_key_b64: str,
+    peer_public_key_b64: str,
+    reserved: list[int] | None = None,
+) -> tuple[bytes, int]:
     s_priv = x25519.X25519PrivateKey.from_private_bytes(base64.b64decode(client_private_key_b64))
     s_pub_bytes = s_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     r_pub_bytes = base64.b64decode(peer_public_key_b64)
     r_pub = x25519.X25519PublicKey.from_public_bytes(r_pub_bytes)
+
     e_priv = x25519.X25519PrivateKey.generate()
     e_pub_bytes = e_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
@@ -981,6 +841,7 @@ def build_wireguard_handshake_initiation(client_private_key_b64: str, peer_publi
     ck, k = _kdf2(ck, e_priv.exchange(r_pub))
     enc_s = _aead_encrypt(k, 0, s_pub_bytes, h)
     h = _blake2s(h + enc_s)
+
     ck, k = _kdf2(ck, s_priv.exchange(r_pub))
     enc_t = _aead_encrypt(k, 0, _tai64n_now(), h)
 
@@ -1004,13 +865,20 @@ class _WGRespProto(asyncio.DatagramProtocol):
             self.fut.set_exception(exc)
 
 
-async def probe_real_warp_handshake(host: str, port: int, priv: str, pub: str, reserved: list[int] | None = None, timeout_sec: float = 2.0) -> tuple[bool, float | None]:
+async def probe_real_warp_handshake(
+    host: str,
+    port: int,
+    client_private_key_b64: str,
+    peer_public_key_b64: str,
+    reserved: list[int] | None = None,
+    timeout_sec: float = 2.0,
+) -> tuple[bool, float | None]:
     loop = asyncio.get_running_loop()
     transport = None
     try:
         clean = host.strip("[]")
         family = socket.AF_INET6 if ipaddress.ip_address(clean).version == 6 else socket.AF_INET
-        pkt, sidx = build_wireguard_handshake_initiation(priv, pub, reserved=reserved)
+        pkt, sidx = build_wireguard_handshake_initiation(client_private_key_b64, peer_public_key_b64, reserved=reserved)
         fut = loop.create_future()
         transport, _ = await asyncio.wait_for(
             loop.create_datagram_endpoint(lambda: _WGRespProto(fut), remote_addr=(clean, port), family=family),
@@ -1019,7 +887,7 @@ async def probe_real_warp_handshake(host: str, port: int, priv: str, pub: str, r
         t0 = time.perf_counter()
         transport.sendto(pkt)
         resp: bytes = await asyncio.wait_for(fut, timeout=timeout_sec)
-        rtt = round((time.perf_counter() - t0) * 1000.0, 1)
+        rtt = round((time.perf_counter() - t0) * 1000.0, 2)
         if len(resp) >= 92 and resp[0] == 2 and struct.unpack("<I", resp[8:12])[0] == sidx:
             return True, rtt
         return False, None
@@ -1028,9 +896,9 @@ async def probe_real_warp_handshake(host: str, port: int, priv: str, pub: str, r
     finally:
         if transport is not None:
             transport.close()
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/warp_builder.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/warp_builder.py
 from __future__ import annotations
 
 import base64
@@ -1047,7 +915,12 @@ PlatformType = Literal["ios", "android", "windows"]
 IPMode = Literal["ipv4", "ipv6", "dual"]
 
 OFFICIAL_WARP_PEER_PUBKEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-WARP_REG_URLS = ["https://api.cloudflareclient.com/v0a2483/reg", "https://api.cloudflareclient.com/v0a2158/reg"]
+
+WARP_REG_URLS = [
+    "https://api.cloudflareclient.com/v0a2483/reg",
+    "https://api.cloudflareclient.com/v0a2158/reg",
+]
+
 OFFICIAL_WARP_IPV6_ENDPOINTS = [
     "[2606:4700:d0::a29f:c001]:2408",
     "[2606:4700:d0::a29f:c005]:854",
@@ -1109,7 +982,11 @@ async def register_real_warp_device(timeout_sec: float = 12.0) -> WarpRegistrati
                 warp_activated = False
                 if dev_id and token:
                     try:
-                        act = await client.patch(f"{reg_url}/{dev_id}", json={"warp_enabled": True}, headers={**headers, "Authorization": f"Bearer {token}"})
+                        act = await client.patch(
+                            f"{reg_url}/{dev_id}",
+                            json={"warp_enabled": True},
+                            headers={**headers, "Authorization": f"Bearer {token}"},
+                        )
                         warp_activated = act.status_code in (200, 201)
                     except Exception:
                         pass
@@ -1125,6 +1002,7 @@ async def register_real_warp_device(timeout_sec: float = 12.0) -> WarpRegistrati
                 )
             except Exception as exc:
                 last_err = str(exc)
+
     return WarpRegistration(ok=False, error=f"خطا در ثبت دستگاه WARP: {last_err}")
 
 
@@ -1161,64 +1039,53 @@ def build_warp_bundle(
     platform: PlatformType,
     ip_mode: IPMode = "ipv6",
     ping_ms: float | None = None,
+    brand: str = "CFHub",
 ) -> dict:
     h4, p4 = split_endpoint(ep_v4)
     h6, p6 = split_endpoint(ep_v6)
 
     if ip_mode == "ipv6":
-        primary_hp, secondary_hp = format_endpoint_hostport(h6, p6), format_endpoint_hostport(h4, p4)
-        mode_tag = "IPv6"
-        local_addrs = [a for a in [reg.ipv4, reg.ipv6] if a]
-        allowed_ips = ["0.0.0.0/0", "::/0"]
-        wg_dns = "2606:4700:4700::1111, 1.1.1.1"
+        primary_hp, secondary_hp, mode_tag = format_endpoint_hostport(h6, p6), format_endpoint_hostport(h4, p4), "IPv6"
+        local_addrs, allowed_ips, wg_dns = [a for a in [reg.ipv4, reg.ipv6] if a], ["0.0.0.0/0", "::/0"], "2606:4700:4700::1111, 1.1.1.1"
     elif ip_mode == "dual":
-        primary_hp, secondary_hp = format_endpoint_hostport(h4, p4), format_endpoint_hostport(h6, p6)
-        mode_tag = "Dual"
-        local_addrs = [a for a in [reg.ipv4, reg.ipv6] if a]
-        allowed_ips = ["0.0.0.0/0", "::/0"]
-        wg_dns = "1.1.1.1, 2606:4700:4700::1111"
+        primary_hp, secondary_hp, mode_tag = format_endpoint_hostport(h4, p4), format_endpoint_hostport(h6, p6), "Dual"
+        local_addrs, allowed_ips, wg_dns = [a for a in [reg.ipv4, reg.ipv6] if a], ["0.0.0.0/0", "::/0"], "1.1.1.1, 2606:4700:4700::1111"
     else:
-        primary_hp, secondary_hp = format_endpoint_hostport(h4, p4), format_endpoint_hostport(h6, p6)
-        mode_tag = "IPv4"
-        local_addrs = [reg.ipv4]
-        allowed_ips = ["0.0.0.0/0"]
-        wg_dns = "1.1.1.1, 8.8.8.8"
+        primary_hp, secondary_hp, mode_tag = format_endpoint_hostport(h4, p4), format_endpoint_hostport(h6, p6), "IPv4"
+        local_addrs, allowed_ips, wg_dns = [reg.ipv4], ["0.0.0.0/0"], "1.1.1.1, 8.8.8.8"
 
     mtu = 1280
     reserved = reg.reserved or [0, 0, 0]
+    reserved_csv = ",".join(str(x) for x in reserved)
     plat_tag = {"ios": "🍏iOS", "android": "🤖Android", "windows": "🪟Win"}[platform]
 
-    wg_label = format_beautiful_name("🛡️CFHub", f"WARP-{mode_tag}", ping_ms, plat_tag)
-    wow_label = format_beautiful_name("🌀CFHub", f"WoW-{mode_tag}", ping_ms, plat_tag)
-    auto_label = format_beautiful_name("🎯CFHub", f"Auto-{mode_tag}", None, plat_tag)
+    wg_label = format_beautiful_name(f"🛡️{brand}", f"WARP-{mode_tag}", ping_ms, plat_tag)
+    wow_label = format_beautiful_name(f"🌀{brand}", f"WoW-{mode_tag}", ping_ms, plat_tag)
+    auto_label = format_beautiful_name(f"🎯{brand}", f"Auto-{mode_tag}", None, plat_tag)
 
-    wg_query = urlencode({"address": ",".join(local_addrs), "reserved": ",".join(str(x) for x in reserved), "publickey": reg.peer_public_key, "mtu": str(mtu)})
+    wg_query = urlencode({"address": ",".join(local_addrs), "reserved": reserved_csv, "publickey": reg.peer_public_key, "mtu": str(mtu)})
     wireguard_uri = f"wireguard://{quote(reg.private_key, safe='')}@{primary_hp}?{wg_query}#{quote(wg_label)}"
     warp_auto_uri = f"warp://auto?ifp=10-20&ifps=20-60&ifpd=5-10&ifpm=m4#{quote(auto_label)}"
-    wow_uri = f"warp://{primary_hp}?ifp=10-20&ifps=20-60&ifpd=5-10&ifpm=m4#{quote(wow_label)}&&detour=warp://{secondary_hp}?ifp=10-20&ifps=20-60&ifpd=5-10#{quote('🌍Exit')}"
+    wow_uri = (
+        f"warp://{primary_hp}?ifp=10-20&ifps=20-60&ifpd=5-10&ifpm=m4#{quote(wow_label)}"
+        f"&&detour=warp://{secondary_hp}?ifp=10-20&ifps=20-60&ifpd=5-10#{quote(f'🌍Exit•{brand}')}"
+    )
 
     amnezia_conf = "\n".join([
-        f"# {wg_label}", "[Interface]",
-        f"PrivateKey = {reg.private_key}",
-        f"Address = {', '.join(local_addrs)}",
-        f"DNS = {wg_dns}", f"MTU = {mtu}",
-        "Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
-        "", "[Peer]",
-        f"PublicKey = {reg.peer_public_key}",
-        f"AllowedIPs = {', '.join(allowed_ips)}",
-        f"Endpoint = {primary_hp}",
-        "PersistentKeepalive = 25",
+        f"# {wg_label}", "[Interface]", f"PrivateKey = {reg.private_key}", f"Address = {', '.join(local_addrs)}",
+        f"DNS = {wg_dns}", f"MTU = {mtu}", "Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
+        "", "[Peer]", f"PublicKey = {reg.peer_public_key}", f"AllowedIPs = {', '.join(allowed_ips)}",
+        f"Endpoint = {primary_hp}", "PersistentKeepalive = 25",
     ]) + "\n"
 
     return {
-        "label": wg_label, "endpoint": primary_hp,
-        "wireguard_uri": wireguard_uri, "warp_auto_uri": warp_auto_uri, "wow_uri": wow_uri,
-        "amnezia_conf": amnezia_conf, "amnezia_filename": f"cfhub_warp_{ip_mode}_{platform}.conf",
-        "reserved": reserved,
+        "label": wg_label, "endpoint": primary_hp, "wireguard_uri": wireguard_uri,
+        "warp_auto_uri": warp_auto_uri, "wow_uri": wow_uri,
+        "amnezia_conf": amnezia_conf, "amnezia_filename": f"cfhub_warp_{ip_mode}_{platform}.conf", "reserved": reserved,
     }
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/bg_engine.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/bg_engine.py
 from __future__ import annotations
 
 import asyncio
@@ -1228,7 +1095,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.bot.operator_scanner import refresh_operator_clean_pools
-from app.bot.proxyip_scanner import discover_and_verify_proxyips
 from app.bot.warp_builder import (
     OFFICIAL_WARP_IPV6_ENDPOINTS,
     OFFICIAL_WARP_PEER_PUBKEY,
@@ -1245,8 +1111,9 @@ WARP_UDP_PORTS = [2408, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 9
 
 def generate_warp_v4_candidates(count: int = 28) -> list[tuple[str, int]]:
     base = [
-        ("162.159.192.1", 2408), ("162.159.192.8", 854), ("162.159.193.1", 2408), ("162.159.193.10", 894),
-        ("162.159.195.1", 2408), ("162.159.195.5", 908), ("188.114.96.1", 2408), ("188.114.97.1", 1074),
+        ("162.159.192.1", 2408), ("162.159.192.8", 854), ("162.159.193.1", 2408),
+        ("162.159.193.10", 894), ("162.159.195.1", 2408), ("162.159.195.5", 908),
+        ("188.114.96.1", 2408), ("188.114.97.1", 1074), ("188.114.98.1", 939), ("188.114.99.1", 1843),
     ]
     seen = set(base)
     while len(base) < count:
@@ -1258,13 +1125,6 @@ def generate_warp_v4_candidates(count: int = 28) -> list[tuple[str, int]]:
 
 
 class BackgroundScannerEngine:
-    """
-    3-Phase Real Autonomous Scanner:
-      1) Operator Clean IPs (MCI / Irancell / Mokhaberat) verified via TLS /cdn-cgi/trace
-      2) Live ProxyIP Discovery & Verification (community pools + admin manual ProxyIPs)
-      3) Real WireGuard Noise_IKpsk2 UDP Handshake (IPv4 + IPv6)
-    """
-
     def __init__(self, store):
         self.store = store
         self._loop_task: asyncio.Task | None = None
@@ -1275,7 +1135,7 @@ class BackgroundScannerEngine:
 
     def start(self) -> None:
         if self._loop_task is None or self._loop_task.done():
-            self._loop_task = asyncio.create_task(self._scheduler_loop(), name="cfhub_bg_v8")
+            self._loop_task = asyncio.create_task(self._scheduler_loop(), name="cfhub_bg_v9")
 
     async def stop(self) -> None:
         if self._loop_task and not self._loop_task.done():
@@ -1292,7 +1152,11 @@ class BackgroundScannerEngine:
         reg = await register_real_warp_device(timeout_sec=10.0)
         if not reg.ok:
             return None
-        dev = {"private_key": reg.private_key, "peer_public_key": reg.peer_public_key or OFFICIAL_WARP_PEER_PUBKEY, "reserved": reg.reserved or [0, 0, 0]}
+        dev = {
+            "private_key": reg.private_key,
+            "peer_public_key": reg.peer_public_key or OFFICIAL_WARP_PEER_PUBKEY,
+            "reserved": reg.reserved or [0, 0, 0],
+        }
         self.store.data["warp_probe_device"] = dev
         self.store.save()
         return dev
@@ -1306,22 +1170,9 @@ class BackgroundScannerEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("V8 background scan error: %s", exc)
+                logger.exception("V9 background scan error: %s", exc)
             hours = max(1, int(self.store.data["settings"].get("auto_scan_interval_hours", 6)))
             await asyncio.sleep(hours * 3600)
-
-    async def refresh_proxyip_pool_only(self) -> list[dict[str, Any]]:
-        manual = self.store.data.get("manual_proxyips", [])
-        timeout_sec = float(self.store.data["settings"].get("scan_timeout_sec", 3.0))
-        verified = await discover_and_verify_proxyips(manual_proxyips=manual, timeout_sec=timeout_sec)
-        if verified:
-            self.store.data["proxyip_pool"] = verified
-            best_addr = verified[0]["address"]
-            for panel in self.store.data.get("panels", {}).values():
-                if panel.get("auto_proxyip", True):
-                    panel["proxy_ip"] = best_addr
-            self.store.save()
-        return self.store.data.get("proxyip_pool", [])
 
     async def run_full_cycle(self, trigger: str = "manual") -> dict[str, Any]:
         if self._scan_lock.locked():
@@ -1329,32 +1180,22 @@ class BackgroundScannerEngine:
 
         async with self._scan_lock:
             self.is_scanning = True
-            timeout_sec = float(self.store.data["settings"].get("scan_timeout_sec", 2.8))
+            timeout_sec = float(self.store.data["settings"].get("scan_timeout_sec", 2.6))
             try:
-                # Phase 1: Operator Clean IPs
                 self.current_stage = "operator_ips"
-                manual_ops = self.store.data.get("manual_operator_ips", {})
-                op_pools = await refresh_operator_clean_pools(manual_overrides=manual_ops, timeout_sec=timeout_sec)
+                manual = self.store.data.get("manual_operator_ips", {})
+                op_pools = await refresh_operator_clean_pools(manual_overrides=manual, timeout_sec=timeout_sec)
                 for op in ("mci", "mtn", "mkh"):
                     if op_pools.get(op):
                         self.store.data["operator_pools"][op] = op_pools[op]
 
-                # Phase 2: Real Verified ProxyIPs
-                self.current_stage = "proxyip_pool"
-                await self.refresh_proxyip_pool_only()
-
-                # Auto-apply freshest Clean IP + ProxyIP to panels
                 if self.store.data["settings"].get("auto_apply_ip", True):
-                    best_proxy = self.get_best_proxyip()
                     for panel in self.store.data.get("panels", {}).values():
                         if panel.get("auto_ip", True):
                             best = self.get_best_operator_ips(panel.get("operator", "mci"), 1)
                             if best:
                                 panel["clean_ip"] = best[0]["ip"]
-                        if panel.get("auto_proxyip", True) and best_proxy:
-                            panel["proxy_ip"] = best_proxy["address"]
 
-                # Phase 3: Real WARP IPv4 + IPv6 UDP Handshake
                 self.current_stage = "warp_udp"
                 probe_dev = await self._ensure_probe_device()
                 now = datetime.now(timezone.utc)
@@ -1369,7 +1210,10 @@ class BackgroundScannerEngine:
                             )
                             if not ok or rtt is None:
                                 return None
-                            return {"endpoint": f"[{host}]:{port}" if version == 6 else f"{host}:{port}", "ip_version": version, "latency_ms": rtt, "tested_at": now.isoformat()}
+                            return {
+                                "endpoint": f"[{host}]:{port}" if version == 6 else f"{host}:{port}",
+                                "ip_version": version, "latency_ms": rtt, "tested_at": now.isoformat(),
+                            }
 
                     v4_res, v6_res = await asyncio.gather(
                         asyncio.gather(*(_test_pair(h, p, 4) for h, p in generate_warp_v4_candidates(28))),
@@ -1388,7 +1232,6 @@ class BackgroundScannerEngine:
                     "mci": len(self.store.data["operator_pools"].get("mci", [])),
                     "mtn": len(self.store.data["operator_pools"].get("mtn", [])),
                     "mkh": len(self.store.data["operator_pools"].get("mkh", [])),
-                    "proxyips": len(self.store.data.get("proxyip_pool", [])),
                     "warp_v4": len(self.store.data.get("warp_v4_pool", [])),
                     "warp_v6": len(self.store.data.get("warp_v6_pool", [])),
                 }
@@ -1396,18 +1239,11 @@ class BackgroundScannerEngine:
                 self.is_scanning = False
                 self.current_stage = "idle"
 
-    def get_best_operator_ips(self, op: str = "mci", count: int = 5) -> list[dict[str, Any]]:
+    def get_best_operator_ips(self, op: str = "mci", count: int = 8) -> list[dict[str, Any]]:
         items = list(self.store.data.get("operator_pools", {}).get(op, []))[:count]
         for it in items:
             it["operator"] = op
         return items
-
-    def get_best_proxyips(self, count: int = 8) -> list[dict[str, Any]]:
-        return list(self.store.data.get("proxyip_pool", []))[:count]
-
-    def get_best_proxyip(self) -> dict[str, Any] | None:
-        pool = self.store.data.get("proxyip_pool", [])
-        return pool[0] if pool else None
 
     def get_best_warp_endpoints(self) -> tuple[str, str, float | None]:
         v4 = self.store.data.get("warp_v4_pool", [])
@@ -1416,9 +1252,9 @@ class BackgroundScannerEngine:
         ep6 = v6[0]["endpoint"] if v6 else OFFICIAL_WARP_IPV6_ENDPOINTS[0]
         ping = v4[0]["latency_ms"] if v4 else (v6[0]["latency_ms"] if v6 else None)
         return ep4, ep6, ping
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/store.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/store.py
 from __future__ import annotations
 
 import json
@@ -1464,8 +1300,6 @@ class PersistentHubStore:
             "panels": {},
             "operator_pools": {"mci": [], "mtn": [], "mkh": []},
             "manual_operator_ips": {"mci": [], "mtn": [], "mkh": []},
-            "proxyip_pool": [],
-            "manual_proxyips": [],
             "warp_v4_pool": [],
             "warp_v6_pool": [],
             "warp_probe_device": None,
@@ -1473,11 +1307,12 @@ class PersistentHubStore:
             "settings": {
                 "support_username": os.getenv("SUPPORT_USERNAME", "").lstrip("@"),
                 "support_user_id": owner_id,
+                "default_proxy_ip": "proxyip.cmliussss.net",
                 "maintenance_mode": False,
                 "auto_apply_ip": True,
                 "auto_scan_enabled": True,
                 "auto_scan_interval_hours": 6,
-                "scan_timeout_sec": 2.8,
+                "scan_timeout_sec": 2.6,
             },
         }
 
@@ -1574,9 +1409,9 @@ class PersistentHubStore:
             if u.get("username", "").lower() == q:
                 return u
         return None
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/cf_manager.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/cf_manager.py
 from __future__ import annotations
 
 import asyncio
@@ -1592,7 +1427,7 @@ import httpx
 from app.bot.operator_scanner import OPERATOR_LABELS
 from app.bot.warp_builder import format_beautiful_name
 from app.bot.worker_template import render_worker_script
-from app.bot.ws_tester import test_worker_tunnel_e2e
+from app.bot.ws_tester import check_ip_routes_worker, test_worker_tunnel_e2e
 
 
 @dataclass
@@ -1602,11 +1437,14 @@ class CloudflareDeployResult:
     account_name: str | None = None
     script_name: str | None = None
     worker_host: str | None = None
+    custom_domain_bound: bool = False
     sub_url: str | None = None
     vless_verified: bool = False
     vless_ms: float | None = None
+    vless_msg: str = ""
     trojan_verified: bool = False
     trojan_ms: float | None = None
+    trojan_msg: str = ""
     error: str | None = None
 
 
@@ -1619,7 +1457,7 @@ class CloudflarePanelService:
         user_uuid: str,
         trojan_password: str,
         script_name: str,
-        verified_proxyips: list[str] | None = None,
+        proxy_ip: str = "proxyip.cmliussss.net",
         operator_pools: dict | None = None,
         brand: str = "CFHub",
     ) -> CloudflareDeployResult:
@@ -1661,7 +1499,7 @@ class CloudflarePanelService:
                 worker_js = render_worker_script(
                     user_uuid=user_uuid,
                     trojan_password=trojan_password,
-                    verified_proxyips=verified_proxyips,
+                    proxy_ip=proxy_ip,
                     operator_pools=operator_pools,
                     brand=brand,
                 )
@@ -1687,13 +1525,40 @@ class CloudflarePanelService:
                 )
 
                 worker_host = f"{script_name}.{subdomain}.workers.dev"
+                custom_bound = False
+
+                # BONUS: If the user's Cloudflare account has an active custom Zone, auto-bind `edge.<zone>`
+                # to eliminate `workers.dev` SNI filtering in Iran completely!
+                try:
+                    r_z = await client.get(f"{self.BASE}/zones", headers=headers, params={"status": "active", "per_page": 3})
+                    zones = r_z.json().get("result") or [] if r_z.status_code == 200 else []
+                    if zones:
+                        zone = zones[0]
+                        zone_id = zone["id"]
+                        custom_host = f"{script_name}.{zone['name']}"
+                        # Bind custom Worker Domain directly via Cloudflare Workers Domains API
+                        r_dom = await client.put(
+                            f"{self.BASE}/accounts/{account_id}/workers/domains",
+                            headers={**headers, "Content-Type": "application/json"},
+                            json={
+                                "environment": "production",
+                                "hostname": custom_host,
+                                "service": script_name,
+                                "zone_id": zone_id,
+                            },
+                        )
+                        if r_dom.status_code in (200, 201) and r_dom.json().get("success"):
+                            worker_host = custom_host
+                            custom_bound = True
+                except Exception:
+                    pass
+
                 sub_url = f"https://{worker_host}/sub/{user_uuid}"
 
-                await asyncio.sleep(2.0)
-                top_proxy = verified_proxyips[0] if verified_proxyips else None
-                (v_ok, v_ms, _), (t_ok, t_ms, _) = await asyncio.gather(
-                    test_worker_tunnel_e2e(worker_host, None, "vless", user_uuid, proxy_ip=top_proxy),
-                    test_worker_tunnel_e2e(worker_host, None, "trojan", trojan_password, proxy_ip=top_proxy),
+                await asyncio.sleep(2.5)
+                (v_ok, v_ms, v_msg), (t_ok, t_ms, t_msg) = await asyncio.gather(
+                    test_worker_tunnel_e2e(worker_host, None, "vless", user_uuid),
+                    test_worker_tunnel_e2e(worker_host, None, "trojan", trojan_password),
                 )
 
                 return CloudflareDeployResult(
@@ -1702,72 +1567,78 @@ class CloudflarePanelService:
                     account_name=account_name,
                     script_name=script_name,
                     worker_host=worker_host,
+                    custom_domain_bound=custom_bound,
                     sub_url=sub_url,
                     vless_verified=v_ok,
                     vless_ms=v_ms,
+                    vless_msg=v_msg,
                     trojan_verified=t_ok,
                     trojan_ms=t_ms,
+                    trojan_msg=t_msg,
                 )
         except Exception as exc:
             return CloudflareDeployResult(ok=False, error=f"خطا در اتصال به کلودفلر: {exc}")
 
     @staticmethod
-    def _ws_path(proxy_ip: str | None) -> str:
-        clean_proxy = (proxy_ip or "").strip()
-        if clean_proxy:
-            return f"/proxyip={clean_proxy}?ed=2560"
-        return "/?ed=2560"
+    async def pick_two_verified_worker_ips(worker_host: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not candidates:
+            return [{"ip": worker_host, "latency_ms": None, "colo": "CF"}]
+        checked = await asyncio.gather(
+            *(check_ip_routes_worker(worker_host, c["ip"], 443, timeout_sec=3.0) for c in candidates[:8])
+        )
+        passing = []
+        for cand, (ok, ms, _) in zip(candidates[:8], checked):
+            if ok:
+                item = dict(cand)
+                if ms is not None:
+                    item["latency_ms"] = ms
+                passing.append(item)
+        if len(passing) >= 2:
+            return passing[:2]
+        if len(passing) == 1:
+            return [passing[0], passing[0]]
+        return [{"ip": worker_host, "latency_ms": None, "colo": "Direct"}, {"ip": worker_host, "latency_ms": None, "colo": "Direct"}]
 
     @staticmethod
-    def build_vless_uri(
-        panel: dict[str, Any],
-        ip: str,
-        operator: str = "mci",
-        ping_ms: float | None = None,
-        colo: str = "",
-        proxy_ip: str | None = None,
-    ) -> str:
-        host_part = f"[{ip}]" if ":" in ip else ip
-        params = {
-            "encryption": "none",
-            "security": "tls",
-            "type": "ws",
-            "host": panel["host"],
-            "sni": panel["sni"],
-            "path": CloudflarePanelService._ws_path(proxy_ip or panel.get("proxy_ip")),
-            "fp": "chrome",
-            "alpn": "http/1.1",
-        }
+    def build_four_clean_configs(panel: dict[str, Any], ip_pair: list[dict[str, Any]], operator: str = "mci") -> dict[str, Any]:
+        it1 = ip_pair[0]
+        it2 = ip_pair[1] if len(ip_pair) > 1 else ip_pair[0]
         op_lbl = OPERATOR_LABELS.get(operator, "⚡CF")
-        tag = format_beautiful_name(op_lbl, "VLESS", ping_ms, colo)
-        return f"vless://{panel['uuid']}@{host_part}:443?{urlencode(params)}#{quote(tag)}"
-
-    @staticmethod
-    def build_trojan_uri(
-        panel: dict[str, Any],
-        ip: str,
-        operator: str = "mci",
-        ping_ms: float | None = None,
-        colo: str = "",
-        proxy_ip: str | None = None,
-    ) -> str:
-        host_part = f"[{ip}]" if ":" in ip else ip
-        params = {
-            "security": "tls",
-            "type": "ws",
-            "host": panel["host"],
-            "sni": panel["sni"],
-            "path": CloudflarePanelService._ws_path(proxy_ip or panel.get("proxy_ip")),
-            "fp": "chrome",
-            "alpn": "http/1.1",
-        }
-        op_lbl = OPERATOR_LABELS.get(operator, "⚡CF")
-        tag = format_beautiful_name(op_lbl, "Trojan", ping_ms, colo)
+        brand = panel.get("name", "CFHub")
         tpass = quote(panel["trojan_password"], safe="")
-        return f"trojan://{tpass}@{host_part}:443?{urlencode(params)}#{quote(tag)}"
-__CFHUB_V8_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/ui.py
+        def _hp(ip: str) -> str:
+            return f"[{ip}]" if ":" in ip else ip
+
+        def _vless(it: dict, idx: int, port: int, fp: str) -> str:
+            params = {
+                "encryption": "none", "security": "tls", "type": "ws",
+                "host": panel["host"], "sni": panel["sni"], "path": "/ws?ed=2560",
+                "fp": fp, "alpn": "http/1.1",
+            }
+            extra = f"{it.get('colo')}•{brand}" if it.get("colo") else brand
+            tag = format_beautiful_name(op_lbl, f"VLESS-{idx}", it.get("latency_ms"), extra)
+            return f"vless://{panel['uuid']}@{_hp(it['ip'])}:{port}?{urlencode(params)}#{quote(tag)}"
+
+        def _trojan(it: dict, idx: int, port: int, fp: str) -> str:
+            params = {
+                "security": "tls", "type": "ws",
+                "host": panel["host"], "sni": panel["sni"], "path": "/ws?ed=2560",
+                "fp": fp, "alpn": "http/1.1",
+            }
+            extra = f"{it.get('colo')}•{brand}" if it.get("colo") else brand
+            tag = format_beautiful_name(op_lbl, f"Trojan-{idx}", it.get("latency_ms"), extra)
+            return f"trojan://{tpass}@{_hp(it['ip'])}:{port}?{urlencode(params)}#{quote(tag)}"
+
+        return {
+            "vless_1": _vless(it1, 1, 443, "chrome"),
+            "vless_2": _vless(it2, 2, 2053, "randomized"),
+            "trojan_1": _trojan(it1, 1, 443, "chrome"),
+            "trojan_2": _trojan(it2, 2, 2083, "randomized"),
+        }
+__CFHUB_V9_EOF__
+
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/ui.py
 from __future__ import annotations
 
 from typing import Literal
@@ -1786,7 +1657,7 @@ CLOUDFLARE_DIRECT_TOKEN_URL = (
     "%7B%22key%22%3A%22zone%22%2C%22type%22%3A%22read%22%7D%2C"
     "%7B%22key%22%3A%22workers_routes%22%2C%22type%22%3A%22edit%22%7D%2C"
     "%7B%22key%22%3A%22dns%22%2C%22type%22%3A%22edit%22%7D"
-    "%5D&accountId=*&zoneId=all&name=CFHubV8"
+    "%5D&accountId=*&zoneId=all&name=CFHubV9"
 )
 CLOUDFLARE_SIGNUP_URL = "https://dash.cloudflare.com/sign-up"
 
@@ -1823,7 +1694,7 @@ def kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
 def main_menu_kb(is_admin: bool = False, has_panel: bool = False, lang: str = "fa") -> InlineKeyboardMarkup:
     if lang == "en":
         top = (
-            [btn("🎛️ My Panel (VLESS + Trojan)", callback_data="m:mypanel", style="success")]
+            [btn("🎛️ My Panel (2 VLESS + 2 Trojan)", callback_data="m:mypanel", style="success")]
             if has_panel
             else [btn("🚀 Create Free Panel (VLESS + Trojan)", callback_data="m:turbo", style="success")]
         )
@@ -1831,14 +1702,8 @@ def main_menu_kb(is_admin: bool = False, has_panel: bool = False, lang: str = "f
             top,
             [btn("🛡️ WARP / WireGuard (IPv4 + IPv6)", callback_data="m:warp", style="primary")],
             [btn("📶 Clean IPs by Operator", callback_data="m:isp", style="primary")],
-            [
-                btn("📱 Apps", callback_data="m:apps", style="primary"),
-                btn("📖 Guide", callback_data="m:guide", style="primary"),
-            ],
-            [
-                btn("💬 Support", callback_data="m:support", style="primary"),
-                btn("🇮🇷 فارسی", callback_data="m:lang", style="primary"),
-            ],
+            [btn("📱 Apps", callback_data="m:apps", style="primary"), btn("📖 Guide", callback_data="m:guide", style="primary")],
+            [btn("💬 Support", callback_data="m:support", style="primary"), btn("🇮🇷 فارسی", callback_data="m:lang", style="primary")],
         ]
         if is_admin:
             rows.append([btn("🛠️ Admin Panel", callback_data="adm:home", style="danger")])
@@ -1853,14 +1718,8 @@ def main_menu_kb(is_admin: bool = False, has_panel: bool = False, lang: str = "f
         top,
         [btn("🛡️ کانفیگ WARP و WireGuard (IPv4 + IPv6)", callback_data="m:warp", style="primary")],
         [btn("📶 آی‌پی تمیز اپراتورها", callback_data="m:isp", style="primary")],
-        [
-            btn("📱 برنامه‌ها", callback_data="m:apps", style="primary"),
-            btn("📖 آموزش اتصال", callback_data="m:guide", style="primary"),
-        ],
-        [
-            btn("💬 پشتیبانی", callback_data="m:support", style="primary"),
-            btn("🌐 English", callback_data="m:lang", style="primary"),
-        ],
+        [btn("📱 برنامه‌ها", callback_data="m:apps", style="primary"), btn("📖 آموزش اتصال", callback_data="m:guide", style="primary")],
+        [btn("💬 پشتیبانی", callback_data="m:support", style="primary"), btn("🌐 English", callback_data="m:lang", style="primary")],
     ]
     if is_admin:
         rows.append([btn("🛠️ پنل مدیریت", callback_data="adm:home", style="danger")])
@@ -1869,13 +1728,12 @@ def main_menu_kb(is_admin: bool = False, has_panel: bool = False, lang: str = "f
 
 def back_home_kb(back_cb: str = "m:home", lang: str = "fa") -> InlineKeyboardMarkup:
     return kb([[btn("🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data=back_cb, style="primary")]])
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
-cat <<'__CFHUB_V8_EOF__' > backend/app/bot/bot.py
+cat <<'__CFHUB_V9_EOF__' > backend/app/bot/bot.py
 from __future__ import annotations
 
 import asyncio
-import base64
 import html
 import logging
 import random
@@ -1905,10 +1763,9 @@ from app.bot.ui import (
     main_menu_kb,
 )
 from app.bot.warp_builder import build_warp_bundle, register_real_warp_device
-from app.bot.ws_tester import test_worker_tunnel_e2e
+from app.bot.ws_tester import check_ip_routes_worker, test_worker_tunnel_e2e
 from app.core.config import get_settings
 from app.core.logging import configure_logging
-from app.protocols.base import generate_qr_png_base64
 from app.services.monitoring import collect_system_health
 
 logger = logging.getLogger(__name__)
@@ -1921,9 +1778,10 @@ cf_service = CloudflarePanelService()
 
 class Flow(StatesGroup):
     waiting_cf_token = State()
+    waiting_panel_name = State()
+    waiting_panel_proxyip = State()
     waiting_support_msg = State()
     adm_import_op_ips = State()
-    adm_import_proxyips = State()
     adm_user_search = State()
     adm_dm_text = State()
     adm_broadcast = State()
@@ -1949,44 +1807,22 @@ async def _edit(cb: CallbackQuery, text: str, markup) -> None:
         await cb.message.answer(text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
 
 
-async def _send_safe_qr(target_msg: Message, payload: str, short_caption: str) -> None:
-    """Sends QR photo with a guaranteed short (<200 char) safe caption so Telegram HTML parser NEVER crashes."""
-    try:
-        uri = generate_qr_png_base64(payload)
-        if uri.startswith("data:image/png;base64,"):
-            raw = base64.b64decode(uri.split(",", 1)[1])
-            await target_msg.answer_photo(
-                photo=BufferedInputFile(raw, filename="qr.png"),
-                caption=short_caption[:200],
-                parse_mode="HTML",
-            )
-    except Exception as exc:
-        logger.warning("QR delivery skipped safely: %s", exc)
-
-
 def _home_text(tg_id: int) -> str:
     pools = store.data.get("operator_pools", {})
-    proxies = store.data.get("proxyip_pool", [])
     panel = store.data.get("panels", {}).get(str(tg_id))
     panel_line = (
         f"🎛️ پنل شما: 🟢 <b>فعال</b> (<code>{html.escape(panel['host'])}</code>)"
         if panel
         else "🎛️ پنل شما: ⚪ هنوز ساخته نشده"
     )
-    proxy_line = (
-        f"🔁 ProxyIP سالم: <b>{len(proxies)}</b> (برترین: <b>{proxies[0]['latency_ms']}ms • {proxies[0]['colo']}</b>)"
-        if proxies
-        else "🔁 ProxyIP سالم: در حال تست خودکار..."
-    )
     return (
         "⚡ <b>Cloudflare Config Hub — کانفیگ رایگان و تست‌شده</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 همراه اول: <b>{len(pools.get('mci', []))}</b> | 🟡 ایرانسل: <b>{len(pools.get('mtn', []))}</b> | 🟢 مخابرات: <b>{len(pools.get('mkh', []))}</b>\n"
-        f"{proxy_line}\n"
         f"🛡️ رله WARP سالم: <b>{len(store.data.get('warp_v4_pool', []))}</b> IPv4 • <b>{len(store.data.get('warp_v6_pool', []))}</b> IPv6\n"
         f"{panel_line}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 بخش مورد نظر را انتخاب کنید:"
+        "👇 گزینه مورد نظر را انتخاب کنید:"
     )
 
 
@@ -2036,20 +1872,20 @@ async def cb_lang(cb: CallbackQuery) -> None:
     await _edit(cb, _home_text(uid), main_menu_kb(_is_admin(uid), _has_panel(uid), lang))
 
 
-# ==================== 1. PANEL DEPLOY (DIRECT CF TOKEN -> REAL E2E VERIFIED VLESS + TROJAN) ====================
+# ==================== 1. PANEL DEPLOY (DIRECT CF TOKEN -> V9 STEALTH WORKER + AUTO CUSTOM DOMAIN) ====================
 @router.callback_query(F.data == "m:turbo")
 async def cb_turbo(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     uid = cb.from_user.id
     await state.set_state(Flow.waiting_cf_token)
     text = (
-        "🚀 <b>ساخت پنل رایگان (VLESS + Trojan)</b>\n"
+        "🚀 <b>ساخت پنل رایگان (۲ VLESS + ۲ Trojan)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "1️⃣ اگر اکانت کلودفلر نداری، اول ثبت‌نام کن.\n"
-        "2️⃣ دکمه سبز <b>دریافت مستقیم توکن</b> را بزن (تمام دسترسی‌ها آماده است).\n"
+        "2️⃣ دکمه سبز <b>دریافت مستقیم توکن</b> را بزن (دسترسی‌ها آماده است).\n"
         "3️⃣ در کلودفلر روی <b>Continue to summary</b> و سپس <b>Create Token</b> بزن.\n"
         "4️⃣ توکن را کپی کن و <b>همینجا بفرست</b>.\n\n"
-        "🔐 <i>پیام توکن بلافاصله پاک و رمزنگاری می‌شود و بهترین ProxyIP تست‌شده به‌طور خودکار روی کانفیگ‌ها سوار می‌شود.</i>"
+        "🔐 <i>اگر دامنه شخصی روی اکانت کلودفلر شما باشد، خودکار متصل می‌شود تا فیلتر workers.dev هم دور زده شود.</i>"
     )
     rows = [
         [btn("🔑 دریافت مستقیم توکن کلودفلر", url=CLOUDFLARE_DIRECT_TOKEN_URL, style="success")],
@@ -2080,27 +1916,23 @@ async def handle_cf_token(message: Message, state: FSMContext) -> None:
         )
         return
 
-    wait_msg = await message.answer("⏳ <b>در حال دیپلوی واقعی Worker دوپروتکله (VLESS + Trojan) + نصب خودکار ProxyIP...</b>", parse_mode="HTML")
+    wait_msg = await message.answer("⏳ <b>در حال دیپلوی موتور V9 و تست واقعی اتصال VLESS و Trojan...</b>", parse_mode="HTML")
 
     old = store.data["panels"].get(str(uid)) or {}
     panel_uuid = old.get("uuid") or str(uuid.uuid4())
     trojan_pass = old.get("trojan_password") or secrets.token_urlsafe(12)
     script_name = old.get("script_name") or f"cfhub-{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
-
-    # Ensure we have live verified ProxyIPs before deploying
-    proxy_objs = bg_engine.get_best_proxyips(8)
-    if not proxy_objs:
-        proxy_objs = await bg_engine.refresh_proxyip_pool_only()
-    verified_proxies = [x["address"] for x in proxy_objs[:8]]
+    brand = old.get("name") or "CFHub"
+    proxy_ip = old.get("proxy_ip") or store.data["settings"].get("default_proxy_ip", "proxyip.cmliussss.net")
 
     dep = await cf_service.deploy_dual_worker(
         api_token=raw_token,
         user_uuid=panel_uuid,
         trojan_password=trojan_pass,
         script_name=script_name,
-        verified_proxyips=verified_proxies,
+        proxy_ip=proxy_ip,
         operator_pools=store.data.get("operator_pools", {}),
-        brand="CFHub",
+        brand=brand,
     )
     if not dep.ok:
         await wait_msg.edit_text(
@@ -2122,39 +1954,39 @@ async def handle_cf_token(message: Message, state: FSMContext) -> None:
     }
     best_mci = bg_engine.get_best_operator_ips("mci", 1)
     clean_ip = best_mci[0]["ip"] if best_mci else "104.16.132.229"
-    top_proxy = verified_proxies[0] if verified_proxies else "proxyip.cmliussss.net:443"
-
     store.data["panels"][str(uid)] = {
+        "name": brand,
         "uuid": panel_uuid,
         "trojan_password": trojan_pass,
         "script_name": dep.script_name,
         "host": dep.worker_host,
         "sni": dep.worker_host,
+        "custom_domain": dep.custom_domain_bound,
         "sub_url": dep.sub_url,
         "operator": old.get("operator", "mci"),
         "clean_ip": clean_ip,
-        "proxy_ip": top_proxy,
+        "proxy_ip": proxy_ip,
         "auto_ip": True,
-        "auto_proxyip": True,
-        "worker_version": "v8",
+        "worker_version": "v9",
         "created_at": old.get("created_at", now),
         "updated_at": now,
     }
     store.save()
     await state.clear()
 
-    v_badge = f"🟢 {dep.vless_ms}ms" if dep.vless_verified else "🟡 در انتظار انتشار"
-    t_badge = f"🟢 {dep.trojan_ms}ms" if dep.trojan_verified else "🟡 در انتظار انتشار"
+    v_badge = f"🟢 {dep.vless_ms}ms" if dep.vless_verified else f"🔴 {html.escape(dep.vless_msg[:75])}"
+    t_badge = f"🟢 {dep.trojan_ms}ms" if dep.trojan_verified else f"🔴 {html.escape(dep.trojan_msg[:75])}"
+    dom_note = " (دامنه شخصی متصل شد ✅)" if dep.custom_domain_bound else ""
     text, markup = _render_personal_panel(uid)
     await wait_msg.edit_text(
-        f"🎉 <b>پنل شما با موفقیت دیپلوی شد!</b>\n"
-        f"🩺 VLESS: <b>{v_badge}</b> | Trojan: <b>{t_badge}</b>\n\n{text}",
+        f"🎉 <b>پنل V9 شما دیپلوی شد!{dom_note}</b>\n"
+        f"🔷 VLESS: <b>{v_badge}</b>\n🔐 Trojan: <b>{t_badge}</b>\n\n{text}",
         parse_mode="HTML",
         reply_markup=markup,
     )
 
 
-# ==================== 2. MY PANEL (FIXED OPERATOR DELIVERY + AUTO PROXYIP BUTTON + NO RENAME CLUTTER) ====================
+# ==================== 2. MY PANEL — EXACT 4 CLEAN CONFIGS (2 VLESS + 2 TROJAN) ====================
 def _render_personal_panel(uid: int) -> tuple[str, object]:
     panel = store.data["panels"].get(str(uid))
     if not panel:
@@ -2167,21 +1999,16 @@ def _render_personal_panel(uid: int) -> tuple[str, object]:
         )
 
     op = panel.get("operator", "mci")
-    best_p = bg_engine.get_best_proxyip()
-    active_proxy = panel.get("proxy_ip") or (best_p["address"] if best_p else "proxyip.cmliussss.net:443")
-    ver_note = "" if panel.get("worker_version") == "v8" else "\n⚠️ <i>یک‌بار دکمه <b>♻️ آپدیت Worker</b> را بزنید تا نسخه سالم V8 فعال شود.</i>\n"
-
+    ver_note = "" if panel.get("worker_version") == "v9" else "\n⚠️ <i>لطفاً یک‌بار دکمه سبز <b>♻️ آپدیت Worker به V9</b> را بزنید.</i>\n"
     text = (
-        "🎛️ <b>پنل اختصاصی من (VLESS + Trojan)</b>\n"
+        "🎛️ <b>پنل اختصاصی من</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🌐 Worker: <code>{html.escape(panel['host'])}</code>\n"
         f"📶 اپراتور فعال: <b>{OPERATOR_LABELS.get(op, op)}</b>\n"
-        f"🟢 IP تمیز فعال: <code>{html.escape(panel.get('clean_ip', '-'))}</code>\n"
-        f"🔁 ProxyIP خودکار: <code>{html.escape(active_proxy)}</code>\n"
-        f"🔗 لینک سابسکریپشن (همه اپراتورها):\n<code>{html.escape(panel.get('sub_url', ''))}</code>\n"
+        f"🔗 لینک سابسکریپشن (۴ کانفیگ مرتب):\n<code>{html.escape(panel.get('sub_url', ''))}</code>\n"
         f"{ver_note}"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 اپراتور خود را بزنید تا کانفیگ سالم <b>VLESS + Trojan</b> دریافت کنید:"
+        "اپراتور خود را بزنید تا <b>۴ کانفیگ سالم و تست‌شده (۲ VLESS + ۲ Trojan)</b> دریافت کنید:"
     )
     markup = kb([
         [
@@ -2189,10 +2016,13 @@ def _render_personal_panel(uid: int) -> tuple[str, object]:
             btn("🟡 ایرانسل", callback_data="cf:getop:mtn", style="success"),
             btn("🟢 مخابرات", callback_data="cf:getop:mkh", style="success"),
         ],
-        [btn("🚀 نصب خودکار قوی‌ترین ProxyIP (یک‌کلیک)", callback_data="cf:auto_proxyip", style="success")],
         [
-            btn("🩺 تست واقعی تونل", callback_data="cf:e2e_test", style="primary"),
-            btn("♻️ آپدیت Worker", callback_data="cf:redeploy", style="primary"),
+            btn("🩺 تست سرتاسری پنل", callback_data="cf:e2e_test", style="primary"),
+            btn("♻️ آپدیت Worker به V9", callback_data="cf:redeploy", style="success"),
+        ],
+        [
+            btn("🏷️ تغییر نام", callback_data="cf:edit_name", style="primary"),
+            btn("🔁 تغییر ProxyIP", callback_data="cf:edit_proxyip", style="primary"),
         ],
         [btn("🗑️ حذف پنل", callback_data="cf:disconnect", style="danger")],
         [btn("🔙 صفحه اول", callback_data="m:home", style="primary")],
@@ -2210,163 +2040,55 @@ async def cb_mypanel(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("cf:getop:"))
 async def cb_cf_get_by_op(cb: CallbackQuery) -> None:
-    """
-    FIXED V8 DELIVERY:
-    Never truncates HTML inside an answer_photo caption!
-    Sends full guaranteed HTML text message (4096-char safe) + separate short-caption QR photo + full try/except.
-    """
     op = cb.data.split(":")[2]
     uid = cb.from_user.id
     panel = store.data["panels"].get(str(uid))
     if not panel or not cb.message:
-        await cb.answer("⚠️ ابتدا پنل خود را بسازید.", show_alert=True)
         return
+    await cb.answer(f"⏳ انتخاب ۲ IP تاییدشده برای {OPERATOR_LABELS.get(op, op)}...")
 
-    await cb.answer(f"⚡ آماده‌سازی کانفیگ {OPERATOR_LABELS.get(op, op)}...")
-    try:
-        # 1) Pick best verified IP for this exact Iran operator
-        best_ips = bg_engine.get_best_operator_ips(op, 6)
-        if best_ips:
-            idx = int(panel.get(f"idx_{op}", 0)) % len(best_ips)
-            panel[f"idx_{op}"] = idx + 1
-            chosen = best_ips[idx]
-            ip = chosen["ip"]
-            ping_ms = chosen.get("latency_ms")
-            colo = chosen.get("colo", "CF")
-        else:
-            ip = panel.get("clean_ip") or "104.16.132.229"
-            ping_ms = None
-            colo = "CF"
+    if not panel.get("trojan_password"):
+        panel["trojan_password"] = secrets.token_urlsafe(12)
 
-        # 2) Auto-mount the fastest verified ProxyIP onto the config!
-        best_proxy = bg_engine.get_best_proxyip()
-        active_proxy = (best_proxy["address"] if best_proxy and panel.get("auto_proxyip", True) else panel.get("proxy_ip")) or "proxyip.cmliussss.net:443"
-        proxy_badge = f"<code>{html.escape(active_proxy)}</code>"
-        if best_proxy and best_proxy["address"] == active_proxy:
-            proxy_badge += f" (🟢{best_proxy['latency_ms']}ms • {best_proxy['colo']})"
+    pool = bg_engine.get_best_operator_ips(op, 8)
+    offset = int(panel.get(f"rot_{op}", 0)) % max(1, len(pool))
+    rotated = pool[offset:] + pool[:offset]
+    panel[f"rot_{op}"] = offset + 2
 
-        panel["operator"] = op
-        panel["clean_ip"] = ip
-        panel["proxy_ip"] = active_proxy
-        if not panel.get("trojan_password"):
-            panel["trojan_password"] = secrets.token_urlsafe(12)
-        store.save()
-        store.increment_stat(uid, "configs_generated")
+    verified_pair = await cf_service.pick_two_verified_worker_ips(panel["host"], rotated)
+    panel["operator"] = op
+    panel["clean_ip"] = verified_pair[0]["ip"]
+    store.save()
+    store.increment_stat(uid, "configs_generated")
 
-        vless_uri = cf_service.build_vless_uri(panel, ip, op, ping_ms, colo, proxy_ip=active_proxy)
-        trojan_uri = cf_service.build_trojan_uri(panel, ip, op, ping_ms, colo, proxy_ip=active_proxy)
-        op_sub = f"{panel.get('sub_url', '')}?op={op}"
-        op_lbl = OPERATOR_LABELS.get(op, op)
+    c4 = cf_service.build_four_clean_configs(panel, verified_pair, operator=op)
+    op_lbl = OPERATOR_LABELS.get(op, op)
+    op_sub = f"{panel.get('sub_url', '')}?op={op}"
 
-        # Send full clean TEXT message (NEVER hits 1024-char photo caption truncation!)
-        msg_text = (
-            f"✅ <b>کانفیگ‌های سالم {op_lbl} آماده شد</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🟢 IP تمیز اپراتور: <code>{html.escape(ip)}</code>" + (f" (<b>{ping_ms}ms • {colo}</b>)" if ping_ms else "") + "\n"
-            f"🔁 ProxyIP خودکار: {proxy_badge}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"1️⃣ <b>کانفیگ VLESS (برای کپی لمس کنید):</b>\n"
-            f"<code>{html.escape(vless_uri)}</code>\n\n"
-            f"2️⃣ <b>کانفیگ Trojan (برای کپی لمس کنید):</b>\n"
-            f"<code>{html.escape(trojan_uri)}</code>\n\n"
-            f"🔗 <b>لینک سابسکریپشن {op_lbl}:</b>\n"
-            f"<code>{html.escape(op_sub)}</code>"
-        )
-        nav = kb([
-            [btn(f"🔄 IP دیگر برای {op_lbl}", callback_data=f"cf:getop:{op}", style="success")],
-            [btn("🚀 تعویض خودکار ProxyIP", callback_data="cf:auto_proxyip", style="primary")],
+    msg = (
+        f"⚡ <b>۴ کانفیگ اختصاصی {op_lbl}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔷 <b>VLESS #1 (پورت 443):</b>\n"
+        f"<code>{html.escape(c4['vless_1'])}</code>\n\n"
+        f"🔷 <b>VLESS #2 (پورت 2053):</b>\n"
+        f"<code>{html.escape(c4['vless_2'])}</code>\n\n"
+        f"🔐 <b>Trojan #1 (پورت 443):</b>\n"
+        f"<code>{html.escape(c4['trojan_1'])}</code>\n\n"
+        f"🔐 <b>Trojan #2 (پورت 2083):</b>\n"
+        f"<code>{html.escape(c4['trojan_2'])}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <b>لینک سابسکریپشن {op_lbl}:</b>\n"
+        f"<code>{html.escape(op_sub)}</code>"
+    )
+    await _edit(
+        cb,
+        msg,
+        kb([
+            [btn(f"🔄 تعویض با ۲ IP جدید ({op_lbl})", callback_data=f"cf:getop:{op}", style="success")],
+            [btn("🩺 تست سرتاسری پنل", callback_data="cf:e2e_test", style="primary")],
             [btn("🎛️ بازگشت به پنل من", callback_data="m:mypanel", style="primary")],
-        ])
-        await cb.message.answer(msg_text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=nav)
-
-        # Send clean QR code in a separate short-caption message
-        await _send_safe_qr(cb.message, vless_uri, f"📱 <b>QR Code — {op_lbl} (VLESS)</b>")
-    except Exception as exc:
-        logger.exception("Failed delivering operator config: %s", exc)
-        await cb.message.answer(
-            f"❌ خطایی هنگام ارسال کانفیگ رخ داد: <code>{html.escape(str(exc))}</code>",
-            parse_mode="HTML",
-            reply_markup=back_home_kb("m:mypanel"),
-        )
-
-
-@router.callback_query(F.data == "cf:auto_proxyip")
-async def cb_cf_auto_proxyip(cb: CallbackQuery) -> None:
-    """One-click live ProxyIP verifier & auto-mounter! Finds the best working ProxyIP via real E2E test against cp.cloudflare.com."""
-    uid = cb.from_user.id
-    panel = store.data["panels"].get(str(uid))
-    if not panel or not cb.message:
-        await cb.answer("⚠️ ابتدا پنل خود را بسازید.", show_alert=True)
-        return
-
-    await cb.answer("🚀 در حال یافتن قوی‌ترین ProxyIP...")
-    wait = await cb.message.answer("⏳ <b>در حال بررسی زنده لیست ProxyIPهای سالم و تست واقعی پینگ با کلودفلر...</b>", parse_mode="HTML")
-
-    try:
-        pool = bg_engine.get_best_proxyips(12)
-        if not pool:
-            pool = await bg_engine.refresh_proxyip_pool_only()
-
-        # Test top candidates E2E through user's OWN Worker targeting cp.cloudflare.com (forces ProxyIP!)
-        chosen_addr = None
-        chosen_ms = None
-        chosen_colo = "CF"
-        for cand in pool[:6]:
-            ok, ms, _ = await test_worker_tunnel_e2e(
-                panel["host"],
-                panel.get("clean_ip"),
-                "vless",
-                panel["uuid"],
-                proxy_ip=cand["address"],
-                target_host="cp.cloudflare.com",
-                timeout_sec=5.5,
-            )
-            if ok and ms is not None:
-                chosen_addr = cand["address"]
-                chosen_ms = ms
-                chosen_colo = cand.get("colo", "CF")
-                break
-
-        if not chosen_addr and pool:
-            # Rotate to next verified ProxyIP from TLS trace pool
-            p_idx = int(panel.get("proxy_idx", 0)) % len(pool)
-            panel["proxy_idx"] = p_idx + 1
-            chosen = pool[p_idx]
-            chosen_addr = chosen["address"]
-            chosen_ms = chosen.get("latency_ms")
-            chosen_colo = chosen.get("colo", "CF")
-
-        if not chosen_addr:
-            await wait.edit_text(
-                "⚠️ در این لحظه ProxyIP سالمی در استخر یافت نشد. چند ثانیه بعد دوباره امتحان کنید.",
-                reply_markup=back_home_kb("m:mypanel"),
-            )
-            return
-
-        panel["proxy_ip"] = chosen_addr
-        panel["auto_proxyip"] = True
-        store.save()
-
-        op = panel.get("operator", "mci")
-        await wait.edit_text(
-            f"✅ <b>قوی‌ترین ProxyIP سالم انتخاب و به‌صورت خودکار روی کانفیگ‌های شما سوار شد!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔁 ProxyIP فعال: <code>{html.escape(chosen_addr)}</code>\n"
-            f"⚡ پینگ تاییدشده: <b>{chosen_ms}ms</b> | دیتاسنتر: <b>{chosen_colo}</b>\n\n"
-            f"👇 الان روی دکمه اپراتور خود بزنید تا کانفیگ جدید با همین ProxyIP ارسال شود:",
-            parse_mode="HTML",
-            reply_markup=kb([
-                [
-                    btn("🔵 همراه اول", callback_data="cf:getop:mci", style="success"),
-                    btn("🟡 ایرانسل", callback_data="cf:getop:mtn", style="success"),
-                    btn("🟢 مخابرات", callback_data="cf:getop:mkh", style="success"),
-                ],
-                [btn("🎛️ بازگشت به پنل من", callback_data="m:mypanel", style="primary")],
-            ]),
-        )
-    except Exception as exc:
-        logger.exception("Auto ProxyIP error: %s", exc)
-        await wait.edit_text(f"❌ خطا: <code>{html.escape(str(exc))}</code>", parse_mode="HTML", reply_markup=back_home_kb("m:mypanel"))
+        ]),
+    )
 
 
 @router.callback_query(F.data == "cf:e2e_test")
@@ -2375,30 +2097,35 @@ async def cb_cf_e2e_test(cb: CallbackQuery) -> None:
     panel = store.data["panels"].get(str(uid))
     if not panel or not cb.message:
         return
-    await cb.answer("🩺 در حال تست واقعی...")
-    wait = await cb.message.answer("⏳ در حال تست واقعی VLESS، Trojan و ProxyIP از طریق Worker شما...")
+    await cb.answer("🩺 در حال تست سرتاسری...")
+    wait = await cb.message.answer("⏳ در حال تست واقعی پنل (با هدر استاندارد مرورگر Chrome)...")
     if not panel.get("trojan_password"):
         panel["trojan_password"] = secrets.token_urlsafe(12)
         store.save()
 
-    p_ip = panel.get("proxy_ip")
-    (v_ok, v_ms, v_m), (t_ok, t_ms, t_m), (p_ok, p_ms, p_m) = await asyncio.gather(
-        test_worker_tunnel_e2e(panel["host"], panel["clean_ip"], "vless", panel["uuid"], proxy_ip=p_ip),
-        test_worker_tunnel_e2e(panel["host"], panel["clean_ip"], "trojan", panel["trojan_password"], proxy_ip=p_ip),
-        test_worker_tunnel_e2e(panel["host"], panel["clean_ip"], "vless", panel["uuid"], proxy_ip=p_ip, target_host="cp.cloudflare.com"),
+    (h_ok, h_ms, h_msg), (v_ok, v_ms, v_msg), (t_ok, t_ms, t_msg), (p_ok, p_ms, p_msg) = await asyncio.gather(
+        check_ip_routes_worker(panel["host"], panel["clean_ip"], 443),
+        test_worker_tunnel_e2e(panel["host"], None, "vless", panel["uuid"], target_host="www.gstatic.com"),
+        test_worker_tunnel_e2e(panel["host"], None, "trojan", panel["trojan_password"], target_host="www.gstatic.com"),
+        test_worker_tunnel_e2e(panel["host"], None, "vless", panel["uuid"], target_host="cp.cloudflare.com"),
     )
-    v_l = f"🟢 <b>موفق</b> ({v_ms}ms)" if v_ok else f"🔴 ناموفق ({html.escape(v_m)})"
-    t_l = f"🟢 <b>موفق</b> ({t_ms}ms)" if t_ok else f"🔴 ناموفق ({html.escape(t_m)})"
-    p_l = f"🟢 <b>موفق</b> ({p_ms}ms)" if p_ok else f"🔴 ناموفق ({html.escape(p_m)})"
 
+    h_l = f"🟢 <b>سالم</b> ({h_ms}ms)" if h_ok else f"🔴 <b>خطا</b> ({html.escape(h_msg[:95])})"
+    v_l = f"🟢 <b>سالم</b> ({v_ms}ms)" if v_ok else f"🔴 <b>خطا</b> ({html.escape(v_msg[:110])})"
+    t_l = f"🟢 <b>سالم</b> ({t_ms}ms)" if t_ok else f"🔴 <b>خطا</b> ({html.escape(t_msg[:110])})"
+    p_l = f"🟢 <b>سالم</b> ({p_ms}ms)" if p_ok else f"🟡 <b>نیاز به ProxyIP</b> ({html.escape(p_msg[:95])})"
+
+    hint = "" if (v_ok and t_ok) else "\n\n💡 روی دکمه سبز <b>♻️ آپدیت Worker به V9</b> بزنید و دوباره تست بگیرید."
     await wait.edit_text(
-        f"🩺 <b>نتیجه تست سرتاسری پنل شما</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔷 VLESS: {v_l}\n"
-        f"🔐 Trojan: {t_l}\n"
-        f"🔁 ProxyIP (<code>{html.escape(str(p_ip or '-'))}</code>): {p_l}",
+        f"🩺 <b>نتیجه تست سرتاسری پنل شما (V9)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 روتینگ IP تمیز (<code>{html.escape(panel['clean_ip'])}</code>): {h_l}\n"
+        f"🔷 تونل واقعی VLESS: {v_l}\n"
+        f"🔐 تونل واقعی Trojan: {t_l}\n"
+        f"🔁 فالبک ProxyIP: {p_l}{hint}",
         parse_mode="HTML",
         reply_markup=kb([
-            [btn("🚀 نصب خودکار قوی‌ترین ProxyIP", callback_data="cf:auto_proxyip", style="success")],
+            [btn("♻️ آپدیت Worker به V9", callback_data="cf:redeploy", style="success")],
             [btn("🎛️ بازگشت به پنل من", callback_data="m:mypanel", style="primary")],
         ]),
     )
@@ -2409,10 +2136,10 @@ async def cb_cf_redeploy(cb: CallbackQuery) -> None:
     uid = cb.from_user.id
     cf = store.data["cf_accounts"].get(str(uid))
     panel = store.data["panels"].get(str(uid))
-    if not cf or not panel or not cb.message:
+    if not cf or not panel:
         await cb.answer("⚠️ اکانت کلودفلر یافت نشد.", show_alert=True)
         return
-    await cb.answer("♻️ در حال آپدیت Worker...")
+    await cb.answer("♻️ در حال آپدیت Worker به V9...")
     try:
         token = store.decrypt_secret(cf["encrypted_token"])
     except Exception:
@@ -2421,30 +2148,66 @@ async def cb_cf_redeploy(cb: CallbackQuery) -> None:
     if not panel.get("trojan_password"):
         panel["trojan_password"] = secrets.token_urlsafe(12)
 
-    verified_proxies = [x["address"] for x in bg_engine.get_best_proxyips(8)]
     dep = await cf_service.deploy_dual_worker(
         api_token=token,
         user_uuid=panel["uuid"],
         trojan_password=panel["trojan_password"],
         script_name=panel.get("script_name", f"cfhub-{uid % 9999}"),
-        verified_proxyips=verified_proxies,
+        proxy_ip=panel.get("proxy_ip", "proxyip.cmliussss.net"),
         operator_pools=store.data.get("operator_pools", {}),
-        brand="CFHub",
+        brand=panel.get("name", "CFHub"),
     )
     if dep.ok:
         panel["host"] = dep.worker_host
         panel["sni"] = dep.worker_host
         panel["sub_url"] = dep.sub_url
-        panel["worker_version"] = "v8"
-        if verified_proxies:
-            panel["proxy_ip"] = verified_proxies[0]
+        panel["custom_domain"] = dep.custom_domain_bound
+        panel["worker_version"] = "v9"
         store.save()
-        v_s = f"🟢 {dep.vless_ms}ms" if dep.vless_verified else "🟡 تست مجدد"
-        t_s = f"🟢 {dep.trojan_ms}ms" if dep.trojan_verified else "🟡 تست مجدد"
+        v_s = f"🟢 {dep.vless_ms}ms" if dep.vless_verified else f"🔴 {html.escape(dep.vless_msg[:60])}"
+        t_s = f"🟢 {dep.trojan_ms}ms" if dep.trojan_verified else f"🔴 {html.escape(dep.trojan_msg[:60])}"
         text, markup = _render_personal_panel(uid)
-        await _edit(cb, f"✅ <b>Worker با کد سالم V8 و ProxyIPهای تاییدشده آپدیت شد!</b>\nVLESS: <b>{v_s}</b> | Trojan: <b>{t_s}</b>\n\n{text}", markup)
+        await _edit(cb, f"✅ <b>Worker به نسخه V9 آپدیت شد!</b>\n🔷 VLESS: <b>{v_s}</b>\n🔐 Trojan: <b>{t_s}</b>\n\n{text}", markup)
     else:
-        await cb.message.answer(f"❌ خطا در آپدیت: <code>{html.escape(dep.error or '')}</code>", parse_mode="HTML")
+        await cb.message.answer(f"❌ خطا در آپدیت Worker: <code>{html.escape(dep.error or '')}</code>", parse_mode="HTML")
+
+
+@router.callback_query(F.data == "cf:edit_name")
+async def cb_cf_edit_name(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+    await state.set_state(Flow.waiting_panel_name)
+    await _edit(cb, "🏷️ نام دلخواه جدید برای کانفیگ‌ها بفرستید:", kb([[btn("❌ انصراف", callback_data="m:mypanel", style="danger")]]))
+
+
+@router.message(Flow.waiting_panel_name)
+async def handle_panel_name(message: Message, state: FSMContext) -> None:
+    uid = message.from_user.id
+    name = (message.text or "").strip()[:20]
+    if str(uid) in store.data["panels"] and name:
+        store.data["panels"][str(uid)]["name"] = name
+        store.save()
+    await state.clear()
+    t, m = _render_personal_panel(uid)
+    await message.answer(f"✅ نام ذخیره شد.\n\n{t}", parse_mode="HTML", reply_markup=m)
+
+
+@router.callback_query(F.data == "cf:edit_proxyip")
+async def cb_cf_edit_proxyip(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+    await state.set_state(Flow.waiting_panel_proxyip)
+    await _edit(cb, "🔁 آدرس ProxyIP جدید بفرستید (پیشنهاد: <code>proxyip.cmliussss.net</code> یا <code>bpb.yousef.isegaro.com</code>):", kb([[btn("❌ انصراف", callback_data="m:mypanel", style="danger")]]))
+
+
+@router.message(Flow.waiting_panel_proxyip)
+async def handle_panel_proxyip(message: Message, state: FSMContext) -> None:
+    uid = message.from_user.id
+    pip = (message.text or "").strip()
+    if str(uid) in store.data["panels"] and pip:
+        store.data["panels"][str(uid)]["proxy_ip"] = pip
+        store.save()
+    await state.clear()
+    t, m = _render_personal_panel(uid)
+    await message.answer(f"✅ ProxyIP ذخیره شد (دکمه آپدیت Worker به V9 را بزنید تا اعمال شود).\n\n{t}", parse_mode="HTML", reply_markup=m)
 
 
 @router.callback_query(F.data == "cf:disconnect")
@@ -2457,7 +2220,7 @@ async def cb_cf_disconnect(cb: CallbackQuery) -> None:
     await _edit(cb, _home_text(uid), main_menu_kb(_is_admin(uid), False, store.get_lang(uid)))
 
 
-# ==================== 3. WARP / WIREGUARD (WORKING CORE) ====================
+# ==================== 3. WARP / WIREGUARD (WORKING CORE, ZERO JSON) ====================
 @router.callback_query(F.data == "m:warp")
 async def cb_warp_menu(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -2509,7 +2272,8 @@ async def cb_warp_go(cb: CallbackQuery) -> None:
         return
 
     ep4, ep6, ping = bg_engine.get_best_warp_endpoints()
-    b = build_warp_bundle(reg, ep4, ep6, platform, ip_mode=ip_mode, ping_ms=ping)  # type: ignore[arg-type]
+    brand = store.data.get("panels", {}).get(str(uid), {}).get("name", "CFHub")
+    b = build_warp_bundle(reg, ep4, ep6, platform, ip_mode=ip_mode, ping_ms=ping, brand=brand)  # type: ignore[arg-type]
     store.increment_stat(uid, "warp_generated")
     await wait.delete()
 
@@ -2518,14 +2282,15 @@ async def cb_warp_go(cb: CallbackQuery) -> None:
         f"🏷️ <b>{html.escape(b['label'])}</b>\n"
         f"🎯 رله: <code>{html.escape(b['endpoint'])}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"1️⃣ <b>پیشنهاد اول (Hiddify / Streisand — اسکن خودکار روی اینترنت شما):</b>\n"
+        f"1️⃣ <b>پیشنهاد اول (Hiddify / Streisand):</b>\n"
         f"<code>{html.escape(b['warp_auto_uri'])}</code>\n\n"
         f"2️⃣ <b>لینک دولایه WoW (Hiddify / Karing):</b>\n"
         f"<code>{html.escape(b['wow_uri'])}</code>\n\n"
-        f"3️⃣ <b>لینک WireGuard ({ip_mode.upper()} — v2rayNG / MahsaNG):</b>\n"
+        f"3️⃣ <b>لینک WireGuard ({ip_mode.upper()}):</b>\n"
         f"<code>{html.escape(b['wireguard_uri'])}</code>"
     )
     await cb.message.answer(txt, parse_mode="HTML")
+
     await cb.message.answer_document(
         document=BufferedInputFile(b["amnezia_conf"].encode("utf-8"), filename=b["amnezia_filename"]),
         caption=f"🛡️ <b>فایل آماده AmneziaWG ({ip_mode.upper()})</b>",
@@ -2543,7 +2308,7 @@ async def cb_isp(cb: CallbackQuery) -> None:
     await cb.answer()
     pools = store.data.get("operator_pools", {})
     text = (
-        "📶 <b>آی‌پی‌های تمیز دسته‌بندی‌شده بر اساس اپراتور</b>\n"
+        "📶 <b>آی‌پی‌های تمیز بر اساس اپراتور</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 همراه اول: <b>{len(pools.get('mci', []))}</b> IP\n"
         f"🟡 ایرانسل: <b>{len(pools.get('mtn', []))}</b> IP\n"
@@ -2570,7 +2335,7 @@ async def cb_isp_show(cb: CallbackQuery) -> None:
     ) or "⏳ در حال دریافت لیست..."
     rows = []
     if _has_panel(cb.from_user.id):
-        rows.append([btn(f"⚡ دریافت VLESS + Trojan روی {lbl}", callback_data=f"cf:getop:{op}", style="success")])
+        rows.append([btn(f"⚡ دریافت ۴ کانفیگ {lbl}", callback_data=f"cf:getop:{op}", style="success")])
     rows.append([btn("🔙 اپراتورها", callback_data="m:isp", style="primary")])
     await _edit(cb, f"📶 <b>IP تمیز {lbl}</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}", kb(rows))
 
@@ -2597,9 +2362,9 @@ async def cb_guide(cb: CallbackQuery) -> None:
         "📖 <b>راهنمای اتصال سریع</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "1️⃣ <b>پنل VLESS + Trojan:</b>\n"
-        "• توکن کلودفلر را یک‌بار ارسال کنید تا پنل شما ساخته شود.\n"
-        "• داخل «🎛️ پنل من» اپراتور خود را بزنید تا لینک <b>VLESS</b> و <b>Trojan</b> با ProxyIP خودکار برایتان ارسال شود.\n"
-        "• در صورت افت سرعت، دکمه <b>🚀 نصب خودکار قوی‌ترین ProxyIP</b> را بزنید.\n\n"
+        "• توکن کلودفلر را بفرستید تا Worker واقعی شما ساخته شود.\n"
+        "• داخل «🎛️ پنل من» اپراتور خود را بزنید تا ۴ کانفیگ مرتب (۲ VLESS + ۲ Trojan) بگیرید.\n"
+        "• روی اینترنت‌های حساس به SNI، در تنظیمات Hiddify یا v2rayNG گزینه <b>TLS Fragment</b> را روشن کنید.\n\n"
         "2️⃣ <b>کانفیگ WARP:</b>\n"
         "• لینک <code>warp://auto...</code> را در <b>Hiddify</b> یا فایل <code>.conf</code> را در <b>AmneziaWG</b> باز کنید."
     )
@@ -2651,39 +2416,36 @@ async def handle_sup_msg(message: Message, state: FSMContext) -> None:
     await message.answer(f"✅ تیکت <b>#{tno}</b> ثبت شد.", parse_mode="HTML", reply_markup=back_home_kb("m:home"))
 
 
-# ==================== 6. CLEAN PRO ADMIN PANEL (WITH PROXYIP POOL MANAGEMENT) ====================
+# ==================== 6. CLEAN ADMIN PANEL ====================
 def _build_admin_dashboard() -> tuple[str, object]:
     sys_h = collect_system_health()
     pools = store.data.get("operator_pools", {})
-    proxies = store.data.get("proxyip_pool", [])
     users = store.data.get("users", {})
     scan_st = f"⏳ {bg_engine.current_stage}" if bg_engine.is_scanning else "🟢 آماده"
     last_s = bg_engine.last_scan_at[:16].replace("T", " ") if bg_engine.last_scan_at else "در انتظار"
 
     text = (
-        "🛠️ <b>پنل مدیریت V8</b>\n"
+        "🛠️ <b>پنل مدیریت V9</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ اسکنر: <b>{scan_st}</b> | آخرین اسکن: <code>{last_s}</code>\n"
         f"📶 IP اپراتورها: 🔵{len(pools.get('mci', []))} | 🟡{len(pools.get('mtn', []))} | 🟢{len(pools.get('mkh', []))}\n"
-        f"🔁 استخر ProxyIP سالم: <b>{len(proxies)}</b>\n"
-        f"🛡️ WARP سالم: <b>{len(store.data.get('warp_v4_pool', []))}</b> v4 • <b>{len(store.data.get('warp_v6_pool', []))}</b> v6\n"
+        f"🛡️ WARP تاییدشده: <b>{len(store.data.get('warp_v4_pool', []))}</b> v4 • <b>{len(store.data.get('warp_v6_pool', []))}</b> v6\n"
         f"👥 کاربران: <b>{len(users)}</b> | 🚀 پنل فعال: <b>{len(store.data.get('panels', {}))}</b>\n"
         f"💻 سرور: CPU <b>{sys_h['cpu_percent']}%</b> | RAM <b>{sys_h['memory_percent']}%</b>"
     )
     markup = kb([
-        [btn("▶️ اسکن فوری (اپراتورها + ProxyIP + WARP)", callback_data="adm:scan_now", style="success")],
+        [btn("▶️ اسکن فوری اپراتورها + WARP", callback_data="adm:scan_now", style="success")],
         [
-            btn("🔁 استخر ProxyIP سالم", callback_data="adm:proxyips", style="success"),
+            btn("🔵 افزودن IP همراه اول", callback_data="adm:addop:mci", style="primary"),
+            btn("🟡 افزودن IP ایرانسل", callback_data="adm:addop:mtn", style="primary"),
+        ],
+        [
+            btn("🟢 افزودن IP مخابرات", callback_data="adm:addop:mkh", style="success"),
             btn("👥 مدیریت کاربران", callback_data="adm:users:0", style="primary"),
         ],
         [
-            btn("🔵 IP همراه اول", callback_data="adm:addop:mci", style="primary"),
-            btn("🟡 IP ایرانسل", callback_data="adm:addop:mtn", style="primary"),
-            btn("🟢 IP مخابرات", callback_data="adm:addop:mkh", style="primary"),
-        ],
-        [
             btn("📢 ارسال همگانی", callback_data="adm:broadcast", style="success"),
-            btn("⚙️ تنظیمات", callback_data="adm:settings", style="primary"),
+            btn("⚙️ تنظیمات و پشتیبانی", callback_data="adm:settings", style="primary"),
         ],
         [btn("🔙 صفحه اول", callback_data="m:home", style="danger")],
     ])
@@ -2708,65 +2470,10 @@ async def cb_adm_scan(cb: CallbackQuery) -> None:
         await cb.answer("⏳ در حال اجراست.", show_alert=True)
         return
     asyncio.create_task(bg_engine.run_full_cycle(trigger="admin"))
-    await cb.answer("🚀 اسکن کامل اپراتورها، ProxyIP و WARP شروع شد!", show_alert=True)
+    await cb.answer("🚀 اسکن شروع شد!", show_alert=True)
     await asyncio.sleep(0.4)
     t, m = _build_admin_dashboard()
     await _edit(cb, t, m)
-
-
-@router.callback_query(F.data == "adm:proxyips")
-async def cb_adm_proxyips(cb: CallbackQuery) -> None:
-    if not _is_admin(cb.from_user.id):
-        return
-    await cb.answer()
-    pool = bg_engine.get_best_proxyips(12)
-    body = "\n".join(
-        f"{i+1}. <code>{x['address']}</code> | 🟢<b>{x['latency_ms']}ms</b> | {x.get('colo', 'CF')} ({x.get('source', '')[:16]})"
-        for i, x in enumerate(pool)
-    ) or "⏳ در حال تست استخر ProxyIP..."
-    await _edit(
-        cb,
-        f"🔁 <b>استخر ProxyIPهای سالم و تاییدشده ({len(store.data.get('proxyip_pool', []))})</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}",
-        kb([
-            [btn("🔄 تست و رفرش فوری ProxyIPها", callback_data="adm:refresh_proxy", style="success")],
-            [btn("➕ افزودن ProxyIP اختصاصی", callback_data="adm:add_proxy", style="primary")],
-            [btn("🔙 پنل مدیریت", callback_data="adm:home", style="danger")],
-        ]),
-    )
-
-
-@router.callback_query(F.data == "adm:refresh_proxy")
-async def cb_adm_refresh_proxy(cb: CallbackQuery) -> None:
-    if not _is_admin(cb.from_user.id):
-        return
-    await cb.answer("⏳ در حال تست ProxyIPها...")
-    await bg_engine.refresh_proxyip_pool_only()
-    await cb_adm_proxyips(cb)
-
-
-@router.callback_query(F.data == "adm:add_proxy")
-async def cb_adm_add_proxy(cb: CallbackQuery, state: FSMContext) -> None:
-    if not _is_admin(cb.from_user.id):
-        return
-    await cb.answer()
-    await state.set_state(Flow.adm_import_proxyips)
-    await _edit(cb, "➕ آدرس‌های ProxyIP (به‌صورت <code>IP:443</code> یا دامنه) را ارسال کنید:", kb([[btn("❌ انصراف", callback_data="adm:proxyips", style="danger")]]))
-
-
-@router.message(Flow.adm_import_proxyips)
-async def handle_adm_add_proxy(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    items = [x.strip() for x in (message.text or "").replace(",", " ").split() if x.strip()]
-    added = 0
-    for it in items:
-        if it not in store.data["manual_proxyips"]:
-            store.data["manual_proxyips"].append(it)
-            added += 1
-    store.save()
-    await state.clear()
-    asyncio.create_task(bg_engine.refresh_proxyip_pool_only())
-    await message.answer(f"✅ {added} مورد اضافه شد و تست زنده آغاز گردید.", reply_markup=back_home_kb("adm:proxyips"))
 
 
 @router.callback_query(F.data.startswith("adm:addop:"))
@@ -3019,7 +2726,7 @@ async def handle_adm_set_sup(message: Message, state: FSMContext) -> None:
 
 # ==================== LIFECYCLE ====================
 async def on_startup() -> None:
-    logger.info("Starting V8 Background Engine (Operator Clean IPs + Verified ProxyIP Pool + WARP IPv4/IPv6)...")
+    logger.info("Starting V9 Background Engine...")
     bg_engine.start()
 
 
@@ -3037,13 +2744,13 @@ async def run_polling() -> None:
     dp.include_router(router)
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    logger.info("Starting Cloudflare Config Hub V8 Pro Bot.")
+    logger.info("Starting Cloudflare Config Hub V9 Zero-403/Zero-500 Pro Bot.")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(run_polling())
-__CFHUB_V8_EOF__
+__CFHUB_V9_EOF__
 
 python3 -c '
 from pathlib import Path
@@ -3061,4 +2768,4 @@ echo ">>> Rebuilding and restarting telegram_bot..."
 docker compose up -d --build telegram_bot
 sleep 4
 docker compose logs --tail=30 telegram_bot
-echo ">>> V8 Upgrade complete! Send /start -> My Panel -> Update Worker -> Tap your Operator."
+echo ">>> V9 Upgrade complete! Send /start -> My Panel -> Update Worker to V9."
