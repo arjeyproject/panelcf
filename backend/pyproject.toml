@@ -1,0 +1,17 @@
+[project]
+name = "cloudflare-config-hub"
+version = "2.0.0"
+description = "Cloudflare Network Configuration Platform (Telegram Bot + Mini App + Web Admin Dashboard)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
