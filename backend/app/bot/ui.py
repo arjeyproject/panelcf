@@ -16,7 +16,7 @@ CLOUDFLARE_DIRECT_TOKEN_URL = (
     "%7B%22key%22%3A%22zone%22%2C%22type%22%3A%22read%22%7D%2C"
     "%7B%22key%22%3A%22workers_routes%22%2C%22type%22%3A%22edit%22%7D%2C"
     "%7B%22key%22%3A%22dns%22%2C%22type%22%3A%22edit%22%7D"
-    "%5D&accountId=*&zoneId=all&name=CFHubV23"
+    "%5D&accountId=*&zoneId=all&name=CFHubV24"
 )
 CLOUDFLARE_SIGNUP_URL = "https://dash.cloudflare.com/sign-up"
 

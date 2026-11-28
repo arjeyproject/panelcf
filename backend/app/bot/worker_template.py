@@ -4,29 +4,36 @@ import base64
 import hashlib
 import json
 
-CURRENT_WORKER_VERSION = "v23"
+CURRENT_WORKER_VERSION = "v24"
 
-DEFAULT_PROXY_IPS = [
+# Curated ProxyIP pool (ONLY used when user explicitly enables ProxyIP!)
+CURATED_PROXY_IPS = [
+    "proxyip.cmliussss.net",
     "proxyip.fxxk.dedyn.io",
     "proxyip.oracle.fxxk.dedyn.io",
-    "bpb.yousef.isegaro.com",
     "proxyip.digitalocean.fxxk.dedyn.io",
-    "proxyip.cmliussss.net",
+    "bpb.yousef.isegaro.com",
     "cdn.xn--b6gac.eu.org",
+    "proxyip.sg.fxxk.dedyn.io",
+    "proxyip.us.fxxk.dedyn.io",
 ]
 
-# V23 Ultra-Resilient Pure-ASCII ES Module for Cloudflare Pages (`_worker.js`) & Workers (`index.js`):
-#   1) Accepts ANY WebSocket upgrade path (`/ws`, `/assets/cdn`, etc.) to evade static path DPI.
-#   2) Direct non-serialized upload path (`remoteBox.writer.write`) + zero-copy download forwarding.
-#   3) 2.2s First-Byte Fast-Failover across ProxyIP relays + `allowHalfOpen: false` clean lifecycle.
-#   4) Dual-DoH DNS (Cloudflare 1.1.1.1 + Google 8.8.8.8 fallback) for zero DNS drops.
+# Backward-compat alias
+DEFAULT_PROXY_IPS = CURATED_PROXY_IPS
+
+# V24 Ultra-Clean Pure-ASCII ES Module for Cloudflare Pages (`_worker.js`) & Workers (`index.js`):
+#   1) DIRECT-FIRST & ZERO PUBLIC PROXY INTERFERENCE: By default (`r: []`), never hangs on dead public ProxyIPs!
+#   2) INSTANT OPTIONAL PROXYIP: If client WS URL passes `?proxyip=host[:port]` (or `?relay=...`), enables clean
+#      fast-failover relay ONLY for that request — zero redeploy needed when user toggles ProxyIP ON/OFF!
+#   3) ZERO-RACE UPLOAD QUEUE: Eliminates early-data / concurrent write corruption (`ready` gate after initData flush).
+#   4) Dual-DoH DNS (1.1.1.1 + dns.google fallback) + clean `allowHalfOpen: false` socket lifecycle.
 WORKER_JS_TEMPLATE = r"""
 import { connect } from 'cloudflare:sockets';
 
 const EMBEDDED_B64 = '__CFG_B64__';
 const WS_OPEN = 1;
 const WS_CLOSING = 2;
-const FIRST_BYTE_TIMEOUT_MS = 2200;
+const FIRST_BYTE_TIMEOUT_MS = 2400;
 
 const HEX = [];
 for (let i = 0; i < 256; i++) {
@@ -43,7 +50,7 @@ function loadConfig(env) {
       return JSON.parse(new TextDecoder().decode(bytes));
     }
   } catch (_) {}
-  return { u: '', h: '', r: [], b: 'CFHub', v: 'v23' };
+  return { u: '', h: '', r: [], v: 'v24' };
 }
 
 export default {
@@ -57,8 +64,8 @@ export default {
         if (url.pathname === '/health') {
           return new Response(JSON.stringify({
             ok: true,
-            v: cfg.v || 'v23',
-            relays: (cfg.r || []).length,
+            v: cfg.v || 'v24',
+            direct_default: (cfg.r || []).length === 0,
             ts: Date.now()
           }), {
             status: 200,
@@ -75,8 +82,8 @@ export default {
         });
       }
 
-      const overrideRelay = url.searchParams.get('relay') || url.searchParams.get('r') || '';
-      return handleStream(request, cfg, overrideRelay);
+      const rawProxy = (url.searchParams.get('proxyip') || url.searchParams.get('relay') || url.searchParams.get('r') || '').trim();
+      return handleStream(request, cfg, rawProxy);
     } catch (err) {
       return new Response(JSON.stringify({ ok: false, error: String(err && err.message || err) }), {
         status: 500,
@@ -124,27 +131,34 @@ function b64ToU8(b64) {
 }
 
 function closeRemote(remoteBox) {
+  remoteBox.ready = false;
   try { if (remoteBox.writer) remoteBox.writer.releaseLock(); } catch (_) {}
   remoteBox.writer = null;
   try { if (remoteBox.sock) remoteBox.sock.close(); } catch (_) {}
   remoteBox.sock = null;
 }
 
-function handleStream(request, cfg, overrideRelay) {
+function handleStream(request, cfg, rawProxy) {
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
   server.accept();
 
-  const remoteBox = { sock: null, writer: null };
+  const remoteBox = { sock: null, writer: null, ready: false };
   let isDns = false;
   let dnsFn = null;
   let closed = false;
 
-  const baseRelays = Array.isArray(cfg.r) ? cfg.r : [];
-  const relayList = overrideRelay
-    ? [overrideRelay].concat(baseRelays.filter((x) => x !== overrideRelay))
-    : baseRelays.slice();
+  // Direct by default! Only populate relays when explicitly enabled via ?proxyip=... or baked into cfg.r
+  let relayList = [];
+  if (rawProxy && rawProxy !== 'off' && rawProxy !== 'none') {
+    relayList = rawProxy.split(',').map((x) => x.trim()).filter(Boolean);
+  }
+  if (Array.isArray(cfg.r) && cfg.r.length > 0 && rawProxy !== 'off') {
+    for (const x of cfg.r) {
+      if (x && !relayList.includes(x)) relayList.push(x);
+    }
+  }
 
   let chain = Promise.resolve();
 
@@ -156,7 +170,7 @@ function handleStream(request, cfg, overrideRelay) {
         await dnsFn(u8);
         return;
       }
-      if (remoteBox.writer) {
+      if (remoteBox.ready && remoteBox.writer) {
         await remoteBox.writer.write(u8);
         return;
       }
@@ -194,13 +208,6 @@ function handleStream(request, cfg, overrideRelay) {
 
   server.addEventListener('message', (e) => {
     if (closed) return;
-    if (remoteBox.writer && !isDns) {
-      remoteBox.writer.write(toU8(e.data)).catch(() => {
-        closeRemote(remoteBox);
-        safeClose(server);
-      });
-      return;
-    }
     enqueue(e.data);
   });
   server.addEventListener('close', () => {
@@ -233,6 +240,7 @@ async function dialUpstream(remoteBox, host, port, initData, ws, respHead, relay
     if (initData && initData.byteLength > 0) {
       await writer.write(initData);
     }
+    remoteBox.ready = true;
     return sock;
   }
 
@@ -249,7 +257,8 @@ async function dialUpstream(remoteBox, host, port, initData, ws, respHead, relay
     }
     try {
       const sock = await openAndSend(hp[0], hp[1]);
-      readLoop(sock, remoteBox, ws, respHead, () => tryRelay(idx + 1)).catch(() => safeClose(ws));
+      const nextRetry = (idx + 1 < relays.length) ? () => tryRelay(idx + 1) : null;
+      readLoop(sock, remoteBox, ws, respHead, nextRetry).catch(() => safeClose(ws));
     } catch (_) {
       await tryRelay(idx + 1);
     }
@@ -257,9 +266,15 @@ async function dialUpstream(remoteBox, host, port, initData, ws, respHead, relay
 
   try {
     const sock = await openAndSend(host, port);
-    readLoop(sock, remoteBox, ws, respHead, () => tryRelay(0)).catch(() => safeClose(ws));
+    const fallback = relays.length > 0 ? () => tryRelay(0) : null;
+    readLoop(sock, remoteBox, ws, respHead, fallback).catch(() => safeClose(ws));
   } catch (_) {
-    await tryRelay(0).catch(() => safeClose(ws));
+    if (relays.length > 0) {
+      await tryRelay(0).catch(() => safeClose(ws));
+    } else {
+      closeRemote(remoteBox);
+      safeClose(ws);
+    }
   }
 }
 
@@ -450,10 +465,13 @@ def build_worker_payload(
     trojan_password: str,
     proxy_ip: str = "",
 ) -> tuple[str, list[dict]]:
+    """
+    V24: By default `proxy_ip=""` -> `r: []` (pure direct mode, ZERO public ProxyIP interference!).
+    Users can enable ProxyIP per-config via WS query `?proxyip=...` at any time without redeploying.
+    """
     safe_tpass = trojan_password.replace("'", "").replace('"', "").strip()
     trojan_hash = hashlib.sha224(safe_tpass.encode("utf-8")).hexdigest()
-    proxies = [p for p in [proxy_ip.strip()] + DEFAULT_PROXY_IPS if p]
-    proxies = list(dict.fromkeys(proxies))
+    proxies = [p.strip() for p in [proxy_ip] if p and p.strip()]
 
     cfg_obj = {
         "u": user_uuid.strip(),

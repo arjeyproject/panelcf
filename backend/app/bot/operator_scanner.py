@@ -31,9 +31,9 @@ def is_restricted_1034_ip(ip_str: str) -> bool:
 
 
 OPERATOR_DNS_SOURCES: dict[str, list[str]] = {
-    "mci": ["mci.ircf.space", "mcic.ircf.space", "mci.cf.vfarid.com", "cf.090227.xyz"],
-    "mtn": ["mtn.ircf.space", "mtnc.ircf.space", "mtn.cf.vfarid.com", "cf.877774.xyz"],
-    "mkh": ["mkh.ircf.space", "tci.ircf.space", "mkh.cf.vfarid.com", "cf.090227.xyz"],
+    "mci": ["mci.ircf.space", "mcic.ircf.space", "mci.cf.vfarid.com", "cf.090227.xyz", "icook.tw", "time.is"],
+    "mtn": ["mtn.ircf.space", "mtnc.ircf.space", "mtn.cf.vfarid.com", "cf.877774.xyz", "visa.com.sg", "csgo.com"],
+    "mkh": ["mkh.ircf.space", "tci.ircf.space", "mkh.cf.vfarid.com", "cf.090227.xyz", "icook.hk", "time.is"],
 }
 
 # Diverse high-throughput Cloudflare CDN subnets (avoids putting all 3 configs on 1 throttled /16!)
@@ -218,6 +218,32 @@ async def verify_cloudflare_edge_ip(ip: str, port: int = 443, timeout_sec: float
             "colo": colo or "CF", "score": score,
             "verified_trace": True, "tested_at": datetime.now(timezone.utc).isoformat(),
         }
+    except Exception:
+        return None
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+async def probe_proxy_ip(host_port: str, timeout_sec: float = 2.6) -> dict[str, Any] | None:
+    """Tests TCP reachability & RTT of a candidate ProxyIP on port 443 (or explicit port)."""
+    s = host_port.strip()
+    if not s:
+        return None
+    host, port = s, 443
+    if ":" in s and not s.startswith("["):
+        parts = s.rsplit(":", 1)
+        if parts[1].isdigit():
+            host, port = parts[0], int(parts[1])
+    writer = None
+    try:
+        t0 = time.perf_counter()
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout_sec)
+        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        return {"proxy_ip": s, "latency_ms": ms, "ok": True, "tested_at": datetime.now(timezone.utc).isoformat()}
     except Exception:
         return None
     finally:

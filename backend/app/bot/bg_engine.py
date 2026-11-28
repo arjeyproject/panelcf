@@ -13,8 +13,10 @@ from app.bot.operator_scanner import (
     is_restricted_1034_ip,
     resolve_doh_records,
     sample_operator_cidr_ips,
+    probe_proxy_ip,
     verify_cloudflare_edge_ip,
 )
+from app.bot.worker_template import CURATED_PROXY_IPS
 from app.bot.warp_builder import (
     OFFICIAL_WARP_IPV6_ENDPOINTS,
     OFFICIAL_WARP_PEER_PUBKEY,
@@ -95,7 +97,7 @@ class BackgroundScannerEngine:
 
     def start(self) -> None:
         if self._loop_task is None or self._loop_task.done():
-            self._loop_task = asyncio.create_task(self._scheduler_loop(), name="cfhub_bg_v23")
+            self._loop_task = asyncio.create_task(self._scheduler_loop(), name="cfhub_bg_v24")
 
     async def stop(self) -> None:
         if self._loop_task and not self._loop_task.done():
@@ -132,7 +134,7 @@ class BackgroundScannerEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("V23 background scan error: %s", exc)
+                logger.exception("V24 background scan error: %s", exc)
             hours = max(1, int(self.store.data["settings"].get("auto_scan_interval_hours", 6)))
             await asyncio.sleep(hours * 3600)
 
@@ -302,6 +304,12 @@ class BackgroundScannerEngine:
                 if v6_ok:
                     self.store.data["warp_v6_pool"] = v6_ok
 
+                self.current_stage = "proxy_ips"
+                await _report(93, "در حال تست زنده لیست ProxyIPهای اختیاری...")
+                p_res = await asyncio.gather(*(probe_proxy_ip(p, timeout_sec=timeout_sec) for p in CURATED_PROXY_IPS))
+                p_ok = sorted([x for x in p_res if x], key=lambda x: x["latency_ms"])
+                if p_ok:
+                    self.store.data["proxy_ip_pool"] = p_ok
                 self.last_scan_at = now.isoformat()
                 self.store.save()
                 await _report(100, "✅ اسکن کامل انجام شد و برترین IPها روی پنل کاربران سوار شد!")
@@ -332,3 +340,15 @@ class BackgroundScannerEngine:
         ep6 = v6[0]["endpoint"] if v6 else OFFICIAL_WARP_IPV6_ENDPOINTS[0]
         ping = v4[0]["latency_ms"] if v4 else (v6[0]["latency_ms"] if v6 else None)
         return ep4, ep6, ping
+
+    def get_proxy_ip_pool(self) -> list[dict[str, Any]]:
+        pool = list(self.store.data.get("proxy_ip_pool") or [])
+        seen = {x.get("proxy_ip") for x in pool}
+        for p in CURATED_PROXY_IPS:
+            if p not in seen:
+                pool.append({"proxy_ip": p, "latency_ms": None, "ok": True})
+        return pool
+
+    def get_best_proxy_ip(self) -> str:
+        pool = self.get_proxy_ip_pool()
+        return str(pool[0]["proxy_ip"]) if pool else CURATED_PROXY_IPS[0]
